@@ -380,7 +380,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -no-gr, --no-graph-reuse            (same as -gr 0)\n");
     printf("  -mmp, --mmap <0|1>                  (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  -nmm, --no-mmap                     (same as -mmp 0)\n");
-    printf("  --numa <distribute|isolate|numactl> (default: disabled)\n");
+    printf("  --numa <distribute|isolate|numactl|mirror> (default: disabled)\n");
     printf("  -embd, --embeddings <0|1>           (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>    (default: 0)\n");
     printf("  -r, -nrep, --repetitions <n>        (default: %d)\n", cmd_params_defaults.reps);
@@ -717,6 +717,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 /**/ if (value == "distribute" || value == "" ) { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
                 else if (value == "isolate")                    { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
                 else if (value == "numactl")                    { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+                else if (value == "mirror")                     { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
                 else { invalid_param = true; break; }
             }
         } else if (arg == "-fa" || arg == "--flash-attn") {
