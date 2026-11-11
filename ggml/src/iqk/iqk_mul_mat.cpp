@@ -800,12 +800,29 @@ inline uint32_t simple_gcd(uint32_t a, uint32_t b) {
 }
 }
 
+#ifdef GGML_AMX
+bool iqk_amx_mul_mat(int nx, int ny, int k, int typeA, const void * A, size_t strideA,
+                     const float * B, size_t strideB, float * C, size_t strideC, int ith, int nth);
+#endif
+
 extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
         long ne02, long ne03, long ne12, long ne13,
         long nb02, long nb03, long nb12, long nb13, long nb2, long nb3,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,
         float * C, long stride_C, int ith, int nth) {
+
+#ifdef GGML_AMX
+    // AMX takes 16 activation rows at a time, so it only pays off in prefill-shaped
+    // calls. Everything else keeps the vec_dot path.
+    if (Ny >= 16 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+        typeB == GGML_TYPE_F32) {
+        if (iqk_amx_mul_mat((int)Nx, (int)Ny, (int)ne00, typeA, A, (size_t)strideA,
+                            (const float *)B, (size_t)strideB, C, (size_t)stride_C, ith, nth)) {
+            return true;
+        }
+    }
+#endif
 
     auto r2 = ne12 / ne02;
     auto r3 = ne13 / ne03;

@@ -142,7 +142,18 @@ void ggml_amx_gemm_int8(int M, int N, int K,
             const int src = m0 + (r < mrows ? r : mrows - 1);
             memcpy(abuf + (size_t)r*K, A + (size_t)src*lda, (size_t)K);
         }
-        iqk_amx_int8_band(abuf, Wpacked, C + (size_t)m0*ldc, N, K);
+        int32_t * dst = C + (size_t)m0*ldc;
+        if (mrows == 16) {
+            iqk_amx_int8_band(abuf, Wpacked, dst, N, K);
+        } else {
+            // the tile always produces 16 rows; only mrows of them are ours
+            int32_t * tmp = (int32_t *) aligned_alloc(64, (size_t)16*N*sizeof(int32_t));
+            if (tmp) {
+                iqk_amx_int8_band(abuf, Wpacked, tmp, N, K);
+                memcpy(dst, tmp, (size_t)mrows*N*sizeof(int32_t));
+                free(tmp);
+            }
+        }
     }
     free(abuf);
 #else
@@ -158,7 +169,7 @@ void ggml_amx_gemm_bf16(int M, int N, int K,
 #if IQK_HAVE_AMX
     if (!ggml_amx_bf16_supported() || N % 16 != 0 || K % 32 != 0) return;
     // fast path: a single 16-row band can be fed to the tiles straight from A
-    if (M <= 16 && (size_t)lda == (size_t)K) {
+    if (M == 16 && (size_t)lda == (size_t)K) {
         iqk_amx_bf16_band(A, Wpacked, C, N, K);
         return;
     }
@@ -171,7 +182,17 @@ void ggml_amx_gemm_bf16(int M, int N, int K,
             const int src = m0 + (r < mrows ? r : mrows - 1);
             memcpy(abuf + (size_t)r*K, A + (size_t)src*lda, (size_t)K*2);
         }
-        iqk_amx_bf16_band(abuf, Wpacked, C + (size_t)m0*ldc, N, K);
+        float * dst = C + (size_t)m0*ldc;
+        if (mrows == 16) {
+            iqk_amx_bf16_band(abuf, Wpacked, dst, N, K);
+        } else {
+            float * tmp = (float *) aligned_alloc(64, (size_t)16*N*sizeof(float));
+            if (tmp) {
+                iqk_amx_bf16_band(abuf, Wpacked, tmp, N, K);
+                memcpy(dst, tmp, (size_t)mrows*N*sizeof(float));
+                free(tmp);
+            }
+        }
     }
     free(abuf);
 #else
