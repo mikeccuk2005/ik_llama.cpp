@@ -201,11 +201,11 @@ if (GGML_IQK_MUL_MAT)
     # AMX is opt-in: off by default so the baseline build has none of it
     option(GGML_AMX "AMX (tile) accelerated mul_mat path" OFF)
     if (GGML_AMX)
-        list(APPEND GGML_SOURCES_IQK_MM iqk/iqk_amx.cpp iqk/iqk_amx_path.cpp)
+        list(APPEND GGML_SOURCES_IQK_MM iqk/iqk_amx.cpp iqk/iqk_amx_path.cpp iqk/iqk_amx_blocked.cpp)
         include(CheckCXXCompilerFlag)
         check_cxx_compiler_flag("-mamx-tile" GGML_HAS_AMX_FLAGS)
         if (GGML_HAS_AMX_FLAGS)
-            set_source_files_properties(iqk/iqk_amx.cpp iqk/iqk_amx_path.cpp PROPERTIES
+            set_source_files_properties(iqk/iqk_amx.cpp iqk/iqk_amx_path.cpp iqk/iqk_amx_blocked.cpp PROPERTIES
                                         COMPILE_OPTIONS "-mamx-tile;-mamx-int8;-mamx-bf16")
             add_compile_definitions(GGML_AMX=1)
             message(STATUS "AMX: enabled")

@@ -85,12 +85,31 @@ bool ggml_amx_pack_bf16(const uint16_t * W, int N, int K, uint16_t * out) {
 static void iqk_amx_int8_band(const int8_t * A, const int8_t * Wp, int32_t * C,
                               int n, int k) {
     iqk_tile_cfg cfg;
-    cfg.rows[0] = 16; cfg.colsb[0] = 64;
-    cfg.rows[1] = 16; cfg.colsb[1] = 64;
-    cfg.rows[2] = 16; cfg.colsb[2] = 64;
+    // tmm0 = A (16 rows x 64 int8), tmm1..3 = three column tiles of B,
+    // tmm4..6 = their int32 accumulators. Seven of the eight tiles, so one A
+    // load feeds three dpbssd instead of one.
+    for (int i = 0; i < 7; i++) { cfg.rows[i] = 16; cfg.colsb[i] = 64; }
     _tile_loadconfig(&cfg);
 
-    for (int n0 = 0; n0 < n; n0 += 16) {
+    int n0 = 0;
+    for (; n0 + 48 <= n; n0 += 48) {
+        _tile_zero(4); _tile_zero(5); _tile_zero(6);
+        for (int k0 = 0; k0 < k; k0 += 64) {
+            _tile_loadd(0, A + k0, (size_t)k);
+            const int8_t * base = Wp + (size_t)(k0/4)*n*4 + (size_t)n0*4;
+            _tile_loadd(1, base,        (size_t)n*4);
+            _tile_loadd(2, base + 16*4, (size_t)n*4);
+            _tile_loadd(3, base + 32*4, (size_t)n*4);
+            _tile_dpbssd(4, 0, 1);
+            _tile_dpbssd(5, 0, 2);
+            _tile_dpbssd(6, 0, 3);
+        }
+        _tile_stored(4, C + n0,      (size_t)n*4);
+        _tile_stored(5, C + n0 + 16, (size_t)n*4);
+        _tile_stored(6, C + n0 + 32, (size_t)n*4);
+    }
+    // tail columns (n not a multiple of 48), one tile at a time
+    for (; n0 < n; n0 += 16) {
         _tile_zero(2);
         for (int k0 = 0; k0 < k; k0 += 64) {
             _tile_loadd(0, A + k0, (size_t)k);
@@ -123,6 +142,83 @@ static void iqk_amx_bf16_band(const uint16_t * A, const uint16_t * Wp, float * C
     _tile_release();
 }
 #endif
+
+// Tile-major packing: out[(t*(K/4) + k4)*64 + n*4 + i] = W[(t*16+n)*K + k4*4 + i].
+// Each 16-column tile is then one contiguous 64-byte-per-row block, so a tile
+// load is a single sequential 1 KB read. The older row-major pack strides rows
+// by N*4, which spreads one tile over 16 cache lines 69 KB apart at N=17408.
+bool ggml_amx_pack_int8_tiles(const int8_t * W, int N, int K, int8_t * out) {
+    if (N % 16 != 0 || K % 64 != 0) return false;
+    const int k4 = K / 4;
+    for (int t = 0; t < N / 16; t++)
+        for (int q = 0; q < k4; q++)
+            for (int n = 0; n < 16; n++)
+                for (int i = 0; i < 4; i++)
+                    out[(size_t)(t * k4 + q) * 64 + n * 4 + i] =
+                        W[((size_t)t * 16 + n) * K + q * 4 + i];
+    return true;
+}
+
+// 48 consecutive columns starting at tile index t0, 16 rows of A, tile-major weights.
+void ggml_amx_int8_block48_tiled(const int8_t * A, size_t lda,
+                                 const int8_t * Wp, int t0, int K,
+                                 int32_t * C, size_t ldc) {
+#if IQK_HAVE_AMX
+    if (!ggml_amx_supported() || K % 64 != 0) return;
+    const int k4 = K / 4;
+    iqk_tile_cfg cfg;
+    for (int i = 0; i < 7; i++) { cfg.rows[i] = 16; cfg.colsb[i] = 64; }
+    _tile_loadconfig(&cfg);
+    _tile_zero(4); _tile_zero(5); _tile_zero(6);
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        _tile_loadd(0, A + k0, lda);
+        const size_t off = (size_t)(k0 / 4) * 64;
+        _tile_loadd(1, Wp + (size_t)(t0    ) * k4 * 64 + off, (size_t)64);
+        _tile_loadd(2, Wp + (size_t)(t0 + 1) * k4 * 64 + off, (size_t)64);
+        _tile_loadd(3, Wp + (size_t)(t0 + 2) * k4 * 64 + off, (size_t)64);
+        _tile_dpbssd(4, 0, 1);
+        _tile_dpbssd(5, 0, 2);
+        _tile_dpbssd(6, 0, 3);
+    }
+    _tile_stored(4, C,      ldc);
+    _tile_stored(5, C + 16, ldc);
+    _tile_stored(6, C + 32, ldc);
+    _tile_release();
+#else
+    (void)A; (void)lda; (void)Wp; (void)t0; (void)K; (void)C; (void)ldc;
+#endif
+}
+
+// One 48-column block of the int8 gemm: C_tile[16 x 48] += A[16 x K] x W[n0..n0+48]^T.
+// The caller loops n0 outside and rows inside, so the weight block is loaded
+// once and reused across every band of activations.
+void ggml_amx_int8_block48(const int8_t * A, size_t lda,
+                           const int8_t * Wpacked, int n, int n0,
+                           int32_t * C, size_t ldc, int K) {
+#if IQK_HAVE_AMX
+    if (!ggml_amx_supported() || K % 64 != 0 || n % 16 != 0) return;
+    iqk_tile_cfg cfg;
+    for (int i = 0; i < 7; i++) { cfg.rows[i] = 16; cfg.colsb[i] = 64; }
+    _tile_loadconfig(&cfg);
+    _tile_zero(4); _tile_zero(5); _tile_zero(6);
+    for (int k0 = 0; k0 < K; k0 += 64) {
+        _tile_loadd(0, A + k0, lda);
+        const int8_t * base = Wpacked + (size_t)(k0/4)*n*4 + (size_t)n0*4;
+        _tile_loadd(1, base,        (size_t)n*4);
+        _tile_loadd(2, base + 16*4, (size_t)n*4);
+        _tile_loadd(3, base + 32*4, (size_t)n*4);
+        _tile_dpbssd(4, 0, 1);
+        _tile_dpbssd(5, 0, 2);
+        _tile_dpbssd(6, 0, 3);
+    }
+    _tile_stored(4, C,          ldc);
+    _tile_stored(5, C + 16,     ldc);
+    _tile_stored(6, C + 32,     ldc);
+    _tile_release();
+#else
+    (void)A; (void)lda; (void)Wpacked; (void)n; (void)n0; (void)C; (void)ldc; (void)K;
+#endif
+}
 
 // C[M x N] int32 = A[M x K] int8 x Wpacked^T, 16-row bands of A.
 void ggml_amx_gemm_int8(int M, int N, int K,
