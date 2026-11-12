@@ -429,6 +429,19 @@ private:
         return cached;
     }
 
+    // Workers park on cv_ forever, so the process must tell them to stop and
+    // join them. Without this a run that actually used the pool (any call with
+    // nth == 1) hangs on exit while -t 4 and above, which never start a worker,
+    // exit cleanly.
+    ~AmxWorkPool() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        for (auto & th : threads_) if (th.joinable()) th.join();
+    }
+
     void ensure(int want) {
         std::lock_guard<std::mutex> lk(m_);
         while (workers_ < want) {
