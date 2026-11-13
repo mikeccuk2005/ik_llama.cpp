@@ -82,6 +82,7 @@ std::atomic<long long> g_band{0};   // caller already split (nth > 1)
 std::atomic<long long> g_build_ns{0};  // wall time spent building shadows
 
 bool quant_row_i8(const float * src, int8_t * dst, int k, float * out_scale);
+static bool quant_row_i8_scalar(const float * src, int8_t * dst, int k, float * out_scale);
 
 __attribute__((constructor)) void amx_stats_register() {
     if (getenv("GGML_AMX_STATS")) {
@@ -115,6 +116,28 @@ __attribute__((constructor)) void amx_stats_register() {
                     g_wide_calls.load(), g_wide_ns.load() / 1e9, g_ny_max.load());
             fprintf(stderr, "split: lookup_s=%.1f quantloop_s=%.1f\n",
                     g_lookup_ns.load() / 1e9, g_quantloop_ns.load() / 1e9);
+            {
+                // Vector path against the scalar reference, element by element,
+                // on data shaped like real activations (a few large magnitudes).
+                std::vector<float> tv((size_t)kq);
+                std::vector<int8_t> va(tv.size()), vb(tv.size());
+                uint64_t seed = 12345;
+                for (size_t i = 0; i < tv.size(); i++) {
+                    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                    float u = (float)((seed >> 33) & 0xFFFFFF) / 16777216.0f * 2.0f - 1.0f;
+                    tv[i] = u * (i % 97 == 0 ? 12.0f : 1.0f);
+                }
+                float sa = 0, sb = 0;
+                quant_row_i8(tv.data(), va.data(), kq, &sa);
+                quant_row_i8_scalar(tv.data(), vb.data(), kq, &sb);
+                int bad = 0, maxd = 0;
+                for (size_t i = 0; i < tv.size(); i++) {
+                    int d = std::abs((int)va[i] - (int)vb[i]);
+                    if (d) { bad++; if (d > maxd) maxd = d; }
+                }
+                fprintf(stderr, "quant_exact: mismatches=%d max_diff=%d scale_diff=%.9g\n",
+                        bad, maxd, (double)(sa - sb));
+            }
             fprintf(stderr, "quant_probe: path=%s %.1f MB/s per call %.3f ms\n",
                     qp, mb / qs, 1000.0 * qs / reps);
         }
