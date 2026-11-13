@@ -27,6 +27,7 @@
 #include <condition_variable>
 #include <omp.h>
 #include <sched.h>
+#include <immintrin.h>
 #include <sys/mman.h>
 
 namespace {
@@ -240,10 +241,14 @@ std::unordered_map<ShadowKey, std::shared_ptr<std::mutex>, ShadowKeyHash> g_buil
 // slot is fingerprinted so a recycled activation buffer is never mistaken for
 // the previous layer's data.
 struct AqShared {
+    // Park, do not spin. Measured at 128 threads: a spin barrier cost 5%
+    // (230.6 against 244.2) because waiters fight the workers for cores. The
+    // futex wakeup was never the ceiling. done and next_panel still get their
+    // own cache lines: both are written by every thread.
     std::mutex m;
     std::condition_variable cv;
-    std::atomic<int> done{0};
-    std::atomic<int> next_panel{0};   // per matmul, so one reset per tensor
+    alignas(64) std::atomic<int> done{0};
+    alignas(64) std::atomic<int> next_panel{0};   // per matmul, one reset
     std::atomic<bool> ready{false};
     std::vector<int8_t> q;
     std::vector<float>  s;
@@ -550,14 +555,15 @@ bool amx_mul_mat_i8(int nx, int ny, int k, const void * A, size_t strideA,
         const int lo = ith * chunk;
         const int hi = (lo + chunk < ny) ? (lo + chunk) : ny;
         for (int r = lo; r < hi; r++) quant_row(r);
-        std::unique_lock<std::mutex> lk(slot->m);
-        slot->done.fetch_add(1);
-        slot->cv.notify_all();
-        if (!slot->cv.wait_for(lk, std::chrono::seconds(2),
-                               [&] { return slot->done.load() >= nth; })) {
-            lk.unlock();
-            for (int r = 0; r < ny; r++) quant_row(r);
-            lk.lock();
+        {
+            std::unique_lock<std::mutex> lk(slot->m);
+            slot->done.fetch_add(1);
+            slot->cv.notify_all();
+            if (!slot->cv.wait_for(lk, std::chrono::seconds(2),
+                                   [&] { return slot->done.load() >= nth; })) {
+                lk.unlock();
+                for (int r = 0; r < ny; r++) quant_row(r);
+            }
         }
         aqp = slot->q.data();
         ascp = slot->s.data();
