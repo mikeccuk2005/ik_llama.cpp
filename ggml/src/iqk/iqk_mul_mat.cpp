@@ -805,7 +805,7 @@ bool iqk_amx_mul_mat(int nx, int ny, int k, int typeA, const void * A, size_t st
                      const float * B, size_t strideB, float * C, size_t strideC, int ith, int nth);
 #else
 // Non-AMX builds still reference the hook, so keep a no-op around for the linker.
-void iqk_amx_prewarm(int, const void *, size_t, int, int) {}
+extern "C" void iqk_amx_prewarm(int, const void *, size_t, int, int) {}
 #endif
 
 extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,

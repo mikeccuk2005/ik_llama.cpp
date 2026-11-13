@@ -819,7 +819,7 @@ bool iqk_amx_mul_mat_enabled(void) {
 // Build the shadow for one weight tensor ahead of compute. Call this at model
 // load, outside any OpenMP region, so all cores can be used; building lazily
 // from inside a compute region serialises on the cache mutex and costs minutes.
-void iqk_amx_prewarm(int type, const void * A, size_t strideA, int nx, int k) {
+extern "C" void iqk_amx_prewarm(int type, const void * A, size_t strideA, int nx, int k) {
     if (!iqk_amx_mul_mat_enabled()) return;
     // The band loop fans out with its own parallel for inside the caller's
     // region, so nesting has to be allowed or those bands run serially.

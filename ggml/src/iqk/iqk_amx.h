@@ -62,6 +62,12 @@ void ggml_amx_int8_block48(const int8_t * A, size_t lda,
 // Prebuild the tile shadow for one weight tensor (bf16, or int8 for Q8_0).
 // Safe to call from any thread when no compute region is active; call it at
 // model load so the first prefill does not pay the dequant.
+// C linkage: llama-model-loader.cpp includes this header inside an extern "C"
+// block, so the definition must not be C++-mangled or the link fails with
+// "undefined reference to iqk_amx_prewarm".
+#ifdef __cplusplus
+extern "C"
+#endif
 void iqk_amx_prewarm(int type, const void * A, size_t strideA, int nx, int k);
 
 // C[M x N] (f32) = A[M x K] (bf16) * Wpacked^T. K multiple of 32.
