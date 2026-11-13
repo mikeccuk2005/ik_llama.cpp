@@ -70,11 +70,18 @@ std::atomic<long long> g_builds{0};
 std::atomic<long long> g_fast{0};
 std::atomic<long long> g_path_ns{0};
 std::atomic<long long> g_quant_ns{0};
+std::atomic<long long> g_lookup_ns{0};
+std::atomic<long long> g_quantloop_ns{0};
+std::atomic<long long> g_wide_calls{0};
+std::atomic<long long> g_wide_ns{0};
+std::atomic<long long> g_ny_max{0};
 std::atomic<long long> g_path_calls{0};
 std::atomic<long long> g_ith_seen[128] = {};
 std::atomic<long long> g_ith_calls[128] = {};   // whole-matrix path (nth == 1)
 std::atomic<long long> g_band{0};   // caller already split (nth > 1)
 std::atomic<long long> g_build_ns{0};  // wall time spent building shadows
+
+bool quant_row_i8(const float * src, int8_t * dst, int k, float * out_scale);
 
 __attribute__((constructor)) void amx_stats_register() {
     if (getenv("GGML_AMX_STATS")) {
@@ -86,6 +93,30 @@ __attribute__((constructor)) void amx_stats_register() {
             for (int i = 0; i < 128; i++)
                 if (g_ith_seen[i].load() && i < 70) fprintf(stderr, " %d:%lld", i, g_ith_seen[i].load());
             fprintf(stderr, "\n");
+        }
+        {
+#if defined(__AVX512F__)
+            const char * qp = "avx512";
+#else
+            const char * qp = "scalar";
+#endif
+            const int kq = 5120, rowsq = 16;
+            std::vector<float> sbuf((size_t)kq * rowsq, 0.5f);
+            std::vector<int8_t> dbuf((size_t)kq * rowsq);
+            float sc = 1.0f;
+            const int reps = 200;
+            auto q0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < reps; r++)
+                for (int row = 0; row < rowsq; row++)
+                    quant_row_i8(sbuf.data() + (size_t)row * kq, dbuf.data() + (size_t)row * kq, kq, &sc);
+            const double qs = std::chrono::duration<double>(std::chrono::steady_clock::now() - q0).count();
+            const double mb = (double)sizeof(float) * kq * rowsq * reps / 1e6;
+            fprintf(stderr, "wide: calls=%lld ns_s=%.1f ny_max=%lld\n",
+                    g_wide_calls.load(), g_wide_ns.load() / 1e9, g_ny_max.load());
+            fprintf(stderr, "split: lookup_s=%.1f quantloop_s=%.1f\n",
+                    g_lookup_ns.load() / 1e9, g_quantloop_ns.load() / 1e9);
+            fprintf(stderr, "quant_probe: path=%s %.1f MB/s per call %.3f ms\n",
+                    qp, mb / qs, 1000.0 * qs / reps);
         }
         fprintf(stderr, "amx_stats: calls=%lld gmac=%.1f shadows=%lld build_s=%.1f fast=%lld band=%lld path_s=%.1f quant_s=%.1f path_calls=%lld\n",
                     g_calls.load(), g_gmac.load() / 1e9, g_builds.load(),
@@ -294,7 +325,9 @@ std::shared_ptr<std::mutex> build_mutex_for(const ShadowKey & key) {
 }
 
 // Quantise one dequantised row to int8 with a single scale for the row.
-bool quant_row_i8(const float * src, int8_t * dst, int k, float * out_scale) {
+// Scalar reference: one pass for amax, one for the conversion. Kept for the
+// no-AVX-512 build and as the thing to check the vector path against.
+static bool quant_row_i8_scalar(const float * src, int8_t * dst, int k, float * out_scale) {
     float amax = 0.0f;
     for (int j = 0; j < k; j++) {
         const float a = std::fabs(src[j]);
@@ -317,21 +350,105 @@ bool quant_row_i8(const float * src, int8_t * dst, int k, float * out_scale) {
     return true;
 }
 
+// Convert one f32 row to int8 with a symmetric row scale. Sixteen lanes at a
+// time: abs+max in the first pass, then multiply, convert, clamp and pack. The
+// scalar version ran at tens of MB/s and was 85% of the AMX path's time.
+bool quant_row_i8(const float * src, int8_t * dst, int k, float * out_scale) {
+#if defined(__AVX512F__)
+    int j = 0;
+    __m512 vmax = _mm512_setzero_ps();
+    for (; j + 16 <= k; j += 16) {
+        const __m512 v = _mm512_loadu_ps(src + j);
+        vmax = _mm512_max_ps(vmax, _mm512_abs_ps(v));
+    }
+    float amax = _mm512_reduce_max_ps(vmax);
+    for (; j < k; j++) {
+        const float a = std::fabs(src[j]);
+        if (a > amax) amax = a;
+    }
+    if (amax <= 0.0f) {
+        memset(dst, 0, (size_t)k);
+        *out_scale = 1.0f;
+        return true;
+    }
+    const float s = amax / 127.0f;
+    const float inv = 1.0f / s;
+    const __m512 vinv  = _mm512_set1_ps(inv);
+    const __m512i vhi  = _mm512_set1_epi32(127);
+    const __m512i vlo  = _mm512_set1_epi32(-127);
+    j = 0;
+    for (; j + 16 <= k; j += 16) {
+        __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(src + j), vinv));
+        q = _mm512_max_epi32(q, vlo);
+        q = _mm512_min_epi32(q, vhi);
+        _mm_storeu_si128((__m128i *)(dst + j), _mm512_cvtepi32_epi8(q));
+    }
+    for (; j < k; j++) {
+        int v = (int)lrintf(src[j] * inv);
+        if (v > 127) v = 127;
+        if (v < -127) v = -127;
+        dst[j] = (int8_t)v;
+    }
+    *out_scale = s;
+    return true;
+#else
+    return quant_row_i8_scalar(src, dst, k, out_scale);
+#endif
+}
+
+// Direct-mapped, lock-free lookup published after the shadow is built. The
+// owning map never erases, so a raw pointer stays valid for the process and the
+// hot path never touches a mutex or a refcount. Readers key on the tensor
+// pointer, and a slot reused by another tensor simply reads as a miss.
+namespace {
+constexpr int kShadowSlots = 4096;
+struct ShadowSlot {
+    std::atomic<const void *>    a{nullptr};
+    std::atomic<int>             nx{0};
+    std::atomic<int>             k{0};
+    std::atomic<const ShadowI8 *> sh{nullptr};
+};
+ShadowSlot g_slots[kShadowSlots];
+
+void shadow_publish(const void * A, int nx, int k, const ShadowI8 * sh) {
+    const size_t h = (((uintptr_t)A >> 6) * 0x9E3779B97F4A7C15ULL
+                      ^ (size_t)(nx * 131 + k)) & (kShadowSlots - 1);
+    g_slots[h].sh.store(sh, std::memory_order_release);
+    g_slots[h].nx.store(nx, std::memory_order_relaxed);
+    g_slots[h].k.store(k, std::memory_order_relaxed);
+    g_slots[h].a.store(A, std::memory_order_release);
+}
+} // namespace
+
 // Build (or fetch) the int8 shadow of a Q8_0 weight tensor.
-std::shared_ptr<const ShadowI8> get_shadow_i8(const void * A, size_t strideA, int nx, int k) {
+const ShadowI8 * get_shadow_i8(const void * A, size_t strideA, int nx, int k) {
     const ShadowKey key{ A, nx, k };
+    const size_t h = (((uintptr_t)A >> 6) * 0x9E3779B97F4A7C15ULL
+                      ^ (size_t)(nx * 131 + k)) & (kShadowSlots - 1);
+    if (g_slots[h].a.load(std::memory_order_acquire) == A &&
+        g_slots[h].nx.load(std::memory_order_relaxed) == nx &&
+        g_slots[h].k.load(std::memory_order_relaxed) == k) {
+        if (const ShadowI8 * hit = g_slots[h].sh.load(std::memory_order_acquire)) return hit;
+    }
+
     std::shared_ptr<std::mutex> kmu;
     {
         std::lock_guard<std::mutex> lock(g_mu);
         auto it = g_shadows_i8.find(key);
-        if (it != g_shadows_i8.end()) return it->second;
+        if (it != g_shadows_i8.end()) {
+            shadow_publish(A, nx, k, it->second.get());
+            return it->second.get();
+        }
         kmu = build_mutex_for(key);
     }
     std::lock_guard<std::mutex> keylock(*kmu);   // one builder per tensor
     {
         std::lock_guard<std::mutex> lock(g_mu);
         auto it = g_shadows_i8.find(key);
-        if (it != g_shadows_i8.end()) return it->second;
+        if (it != g_shadows_i8.end()) {
+            shadow_publish(A, nx, k, it->second.get());
+            return it->second.get();
+        }
     }
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -362,10 +479,14 @@ std::shared_ptr<const ShadowI8> get_shadow_i8(const void * A, size_t strideA, in
     {
         std::lock_guard<std::mutex> lock(g_mu);
         auto it = g_shadows_i8.find(key);
-        if (it != g_shadows_i8.end()) return it->second;
+        if (it != g_shadows_i8.end()) {
+            shadow_publish(A, nx, k, it->second.get());
+            return it->second.get();
+        }
         g_shadows_i8[key] = sh;
     }
-    return sh;
+    shadow_publish(A, nx, k, sh.get());
+    return sh.get();
 }
 
 // Persistent work-sharing pool. One thread per core lives for the whole process
@@ -510,10 +631,12 @@ bool amx_int8_available(void) {
 bool amx_mul_mat_i8(int nx, int ny, int k, const void * A, size_t strideA,
                     const float * B, size_t strideB,
                     float * C, size_t strideC, int ith, int nth) {
-    std::shared_ptr<const ShadowI8> sh = get_shadow_i8(A, strideA, nx, k);
+    const auto t_enter = std::chrono::steady_clock::now();
+    const ShadowI8 * sh = get_shadow_i8(A, strideA, nx, k);
     if (!sh) return false;
-
     const auto t_call = std::chrono::steady_clock::now();
+    if (getenv("GGML_AMX_STATS"))
+        g_lookup_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_call - t_enter).count();
     if (ith >= 0 && ith < 128) g_ith_seen[ith].fetch_add(1);
     const int npad = sh->nx_pad;              // a multiple of 96
     const int bands = (ny + 15) / 16;
@@ -553,13 +676,20 @@ bool amx_mul_mat_i8(int nx, int ny, int k, const void * A, size_t strideA,
     // that through a 128-thread barrier costs more than converting it again, so
     // every thread converts its own copy and nobody waits. Only wider calls are
     // worth synchronising.
+    if (ny > g_ny_max.load()) g_ny_max.store(ny);
+    const auto t_wide0 = std::chrono::steady_clock::now();
     if (nth > 1 && ny > 16) {
+        g_wide_calls.fetch_add(1);
         slot = aq_slot(B, ny, k, need);
         const int chunk = (ny + nth - 1) / nth;
         const int lo = ith * chunk;
         const int hi = (lo + chunk < ny) ? (lo + chunk) : ny;
         for (int r = lo; r < hi; r++) quant_row(r);
         {
+            // Team join for the wide calls, measured at 3.9 ms each. A spin
+            // loop on an atomic counter was tried and measured worse (231-236
+            // t/s against 245): 128 threads spinning steal cycles from the
+            // threads still converting. The parked wait stays.
             std::unique_lock<std::mutex> lk(slot->m);
             slot->done.fetch_add(1);
             slot->cv.notify_all();
@@ -571,8 +701,19 @@ bool amx_mul_mat_i8(int nx, int ny, int k, const void * A, size_t strideA,
         }
         aqp = slot->q.data();
         ascp = slot->s.data();
+        if (getenv("GGML_AMX_STATS"))
+            g_wide_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_wide0).count();
     } else {
-        amx_parallel_for(ny, quant_row);
+        // We are already one of the caller's threads and this call owns at most
+        // a band of rows. Submitting that to the shared pool made 128 callers
+        // queue work on the same workers and wait for it, which measured as 85%
+        // of the path's time. Just convert here.
+        const auto t_q0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < ny; r++) quant_row(r);
+        if (getenv("GGML_AMX_STATS"))
+            g_quantloop_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_q0).count();
         aqp = aq.data();
         ascp = asc.data();
     }
