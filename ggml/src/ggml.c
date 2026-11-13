@@ -18797,6 +18797,15 @@ static int ggml_compute_forward_mul_mat(
 
 #if GGML_USE_IQK_MULMAT
     if (dst->type == GGML_TYPE_F32) {
+        {
+            static int dbg_mm = 0;
+            if (getenv("GGML_MM_DEBUG") && dbg_mm < 12) {
+                dbg_mm++;
+                fprintf(stderr, "mm[%d]: ne01=%lld ne11=%lld ne00=%lld ne12=%lld ith=%d nth=%d src1=%s\n",
+                        dbg_mm, (long long)ne01, (long long)ne11, (long long)ne00,
+                        (long long)ne12, ith, nth, src1->name);
+            }
+        }
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
                     src0->type, src0->data, nb01,

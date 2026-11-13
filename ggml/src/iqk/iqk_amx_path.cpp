@@ -549,7 +549,11 @@ bool amx_mul_mat_i8(int nx, int ny, int k, const void * A, size_t strideA,
     const int8_t * aqp = nullptr;
     const float *  ascp = nullptr;
     std::shared_ptr<AqShared> slot;
-    if (nth > 1) {
+    // A call carrying one band is 16 activation rows, 80 KB at k=5120. Sharing
+    // that through a 128-thread barrier costs more than converting it again, so
+    // every thread converts its own copy and nobody waits. Only wider calls are
+    // worth synchronising.
+    if (nth > 1 && ny > 16) {
         slot = aq_slot(B, ny, k, need);
         const int chunk = (ny + nth - 1) / nth;
         const int lo = ith * chunk;
@@ -608,13 +612,17 @@ bool amx_mul_mat_i8(int nx, int ny, int k, const void * A, size_t strideA,
     };
 
     const auto t_panels = std::chrono::steady_clock::now();
-    if (nth > 1) {
-        // 107 panels over 64 threads leaves 43 threads with two panels and 21
-        // with one, so a third of the team idles at the next barrier. Panels
-        // cost the same, so a shared counter balances it exactly.
+    if (nth > 1 && slot) {
+        // Wider calls: panels outnumber nothing in particular, so a shared
+        // counter balances the tail.
         for (int p = slot->next_panel.fetch_add(1); p < npanels;
              p = slot->next_panel.fetch_add(1))
             work_panel(p);
+    } else if (nth > 1) {
+        // One band per call: stride by thread index, touching no shared state.
+        // A stride, not a single index, because nx=17408 gives 182 panels which
+        // is more than the thread count.
+        for (int p = ith; p < npanels; p += nth) work_panel(p);
     } else {
         amx_parallel_for(npanels, work_panel);
     }
