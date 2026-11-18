@@ -5080,6 +5080,33 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         };
 
         const int ret = server_decode(ctx, batch_view);
+
+        // Copy the drafted rows out before anything else decodes: the mapping they were
+        // sampled from is about to be overwritten by the next llama_decode().
+        const int32_t n_voc = llama_n_vocab(llama_get_model(ctx));
+        if (ret == 0 && n_voc > 0) {
+            for (auto & slot : slots) {
+                if (slot.i_batch_dft.empty()) {
+                    continue;
+                }
+                slot.logits_cache.resize(slot.i_batch_dft.size() * (size_t) n_voc);
+                bool ok = true;
+                for (size_t k = 0; k < slot.i_batch_dft.size(); ++k) {
+                    const float * row = nullptr;
+                    try {
+                        row = llama_get_logits_ith(ctx, slot.i_batch_dft[k]);
+                    } catch (const std::exception &) {
+                        // index not in this batch (another slot decoded in between)
+                        ok = false;
+                        break;
+                    }
+                    memcpy(slot.logits_cache.data() + k * (size_t) n_voc, row, (size_t) n_voc * sizeof(float));
+                }
+                if (!ok) {
+                    slot.logits_cache.clear();
+                }
+            }
+        }
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;

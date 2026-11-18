@@ -72,6 +72,11 @@ struct server_slot {
     // non-empty if we went to evaluate draft tokens
     // ref: https://github.com/ggml-org/llama.cpp/pull/17808
     std::vector<int32_t> i_batch_dft;
+    // Logits rows for the drafted tokens, copied right after the verification decode.
+    // output_ids is global to the context and every later decode rewrites it, so a slot's
+    // cached indices go stale as soon as another slot decodes. Hold the bytes instead;
+    // they stay valid until the slot is handed new work.
+    std::vector<float> logits_cache;
 
     std::vector<completion_token_output> generated_token_probs;
 
