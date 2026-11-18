@@ -641,6 +641,7 @@ struct gpt_params {
 
     bool sweep_bench_output_jsonl = false;
     bool minilog = false;
+    std::string loglevel = "info"; // off|error|warn|info|debug
 };
 
 

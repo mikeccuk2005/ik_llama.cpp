@@ -6,6 +6,7 @@
 #include "chat.h"
 
 #include "common.h"
+#include "log.h"
 #include "speculative.h"
 #include "mtmd.h"
 #include "sampling.h"
@@ -17,12 +18,20 @@
 // mime type for sending response
 #define MIMETYPE_JSON "application/json; charset=utf-8"
 
+// Minimum level for LLAMA_LOG/ggml lines to reach stderr/--log-file; set from
+// --loglevel in main. CONT lines follow INFO since they continue an INFO dump.
+static ggml_log_level g_loglevel_floor = GGML_LOG_LEVEL_INFO;
+
 // Tee llama/ggml log output to --log-file (when set) and stderr. Gated on
 // log_target_changed() so it's a no-op unless --log-file was passed (LOG_TARGET
 // is non-null by default). The stdout/stderr guard mirrors LOG_TEE_IMPL and
 // avoids doubled output when fopen() falls back to stderr.
 static void llama_log_tee_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
     if (text == nullptr) {
+        return;
+    }
+    const ggml_log_level eff = level == GGML_LOG_LEVEL_CONT ? GGML_LOG_LEVEL_INFO : level;
+    if (eff < g_loglevel_floor) {
         return;
     }
     if (log_target_changed()) {
@@ -540,6 +549,29 @@ int main(int argc, char ** argv) {
     // TODO: not great to use extern vars
     server_log_json = params.log_json;
     server_verbose = params.verbosity > 0;
+    // --loglevel drives both log pipelines: the common_log verbosity threshold
+    // (SRV_/LOG_* macros) and the tee floor above for LLAMA_LOG/ggml lines.
+    {
+        const std::string & lvl = params.loglevel;
+        int thold;
+        ggml_log_level floor_lvl;
+        if (lvl == "off") {
+            thold = -1; floor_lvl = (ggml_log_level) 99;
+        } else if (lvl == "error") {
+            thold = LOG_LEVEL_ERROR; floor_lvl = GGML_LOG_LEVEL_ERROR;
+        } else if (lvl == "warn") {
+            thold = LOG_LEVEL_WARN;  floor_lvl = GGML_LOG_LEVEL_WARN;
+        } else if (lvl == "info") {
+            thold = LOG_LEVEL_INFO;  floor_lvl = GGML_LOG_LEVEL_INFO;
+        } else if (lvl == "debug") {
+            thold = LOG_LEVEL_DEBUG; floor_lvl = GGML_LOG_LEVEL_DEBUG;
+        } else {
+            fprintf(stderr, "error: invalid --loglevel '%s' (expected: off|error|warn|info|debug)\n", lvl.c_str());
+            exit(1);
+        }
+        common_log_set_verbosity_thold(thold);
+        g_loglevel_floor = floor_lvl;
+    }
 
 
     // struct that contains llama context and inference

@@ -1140,7 +1140,7 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         // don't update the cache if the slot's context is above cache_ram_n_min
         update_cache = update_cache && cache_token_size >= cache_ram_n_min;
 
-        LLAMA_LOG_INFO("======== Prompt cache: cache size: %d, n_keep: %d, n_discarded_prompt: %d, cache_ram_n_min: %d, f_keep: %.2f, cache_ram_similarity: %.2f\n",
+        LOG_DBG("======== Prompt cache: cache size: %d, n_keep: %d, n_discarded_prompt: %d, cache_ram_n_min: %d, f_keep: %.2f, cache_ram_similarity: %.2f\n",
             (int)tokens.size(), ret->n_kept_prompt, ret->n_discarded_prompt, cache_ram_n_min, f_keep, cache_ram_similarity);
         if (update_cache) {
             const int64_t t_start = ggml_time_us();
@@ -3524,10 +3524,10 @@ void server_context::on_finish_multitask(const server_task_multi& multitask) {
 
 void server_context::print_tokens(const server_tokens& prompt, const server_tokens& cache, size_t start1, size_t start2, size_t length) {
     if (cache.size() > start2) {
-        LLAMA_LOG_INFO("cache : %s\n", cache.detokenize(ctx, true, start2, length).c_str());
+        LOG_DBG("cache : %s\n", cache.detokenize(ctx, true, start2, length).c_str());
     }
     if (prompt.size() > start1) {
-        LLAMA_LOG_INFO("prompt: %s\n", prompt.detokenize(ctx, true, start1, length).c_str());
+        LOG_DBG("prompt: %s\n", prompt.detokenize(ctx, true, start1, length).c_str());
     }
 
 }
@@ -4303,7 +4303,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                             // reuse any previously computed tokens that are common with the new prompt
                             common_prefix prefix = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens);
-                            LLAMA_LOG_INFO("======== Cache: cache_size = %d, n_past =  %d, n_past_prompt = %d\n", (int32_t)slot.cache_tokens.size(),  (int32_t)prefix.first, (int32_t)prefix.second);
+                            LOG_DBG("======== Cache: cache_size = %d, n_past =  %d, n_past_prompt = %d\n", (int32_t)slot.cache_tokens.size(),  (int32_t)prefix.first, (int32_t)prefix.second);
                             int32_t size_threshold = 20;
                             slot.n_past = prefix.first;
                             slot.n_past_prompt = prefix.second;

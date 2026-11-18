@@ -1018,6 +1018,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_ENDPOINT_SLOTS",   params.endpoint_slots);
     get_env("LLAMA_ARG_EMBEDDINGS",       params.embedding);
     get_env("LLAMA_ARG_FLASH_ATTN",       params.flash_attn);
+    get_env("LLAMA_ARG_LOGLEVEL",       params.loglevel);
     get_env("LLAMA_ARG_DEFRAG_THOLD",     params.defrag_thold);
     get_env("LLAMA_ARG_CONT_BATCHING",    params.cont_batching);
     get_env("LLAMA_ARG_HOST",             params.hostname);
@@ -2626,6 +2627,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.verbosity = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--loglevel") {
+        CHECK_ARG
+        params.loglevel = argv[i];
+        return true;
+    }
     if (arg == "--verbose-prompt") {
         params.verbose_prompt = true;
         return true;
@@ -3377,6 +3383,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --version",              "show version and build info" });
     options.push_back({ "*",           "-v,    --verbose",              "print verbose information" });
     options.push_back({ "*",           "       --minilog",              "print important information" });
+    options.push_back({ "*",           "       --loglevel LVL",         "log level: off|error|warn|info|debug (default: info)" });
     options.push_back({ "*",           "       --verbosity N",          "set specific verbosity level (default: %d)", params.verbosity });
     options.push_back({ "*",           "       --verbose-prompt",       "print a verbose prompt before generation (default: %s)", params.verbose_prompt ? "true" : "false" });
     options.push_back({ "*",           "-dr,   --dry-run",       "skip loading tensors in the files"});
