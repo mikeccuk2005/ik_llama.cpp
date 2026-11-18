@@ -11380,19 +11380,15 @@ int llama_spec_ckpt_init(struct llama_context * ctx, llama_ckpt_data ckpt_type, 
     int resolved = LLAMA_SPEC_CKPT_NONE;
 
     const auto prepare_per_step = [&]() {
-        // Per-step snapshots are indexed by step alone, so they hold one sequence's
-        // rows. With several slots live a snapshot taken for one slot would be
-        // restored into another. The whole-state shadow path copies the complete
-        // multi-seq state instead, which is already correct, so decline here and let
-        // AUTO fall through to it.
-        if (llama_n_seq_max(ctx) > 1) {
-            LLAMA_LOG_INFO("%s: %u sequences, per-step snapshots are single-sequence; using whole-state shadows\n",
-                    __func__, llama_n_seq_max(ctx));
-            return false;
-        }
+        // llama_n_seq_max() returns the KV cell count, not the slot count; use
+        // cparams.n_seq_max (the -np value) to decide. Per-step restores one sequence's
+        // rows by step and is the only mechanism that isolates slots, so it is preferred
+        // whenever more than one slot can speculate. The whole-state shadow restores the
+        // complete cache and cannot represent different per-slot rollback points.
+        const uint32_t n_seq = std::max<uint32_t>(1, ctx->cparams.n_seq_max);
         return is_dsv4
             ? llama_dsv4_spec_ckpt_prepare(ctx, ckpt_type, LLAMA_SPEC_CKPT_PER_STEP, max_tokens)
-            : spec_ckpt_try_per_step(kv, ctx->model, ckpt_type, max_tokens, llama_n_seq_max(ctx));
+            : spec_ckpt_try_per_step(kv, ctx->model, ckpt_type, max_tokens, n_seq);
     };
     const auto prepare_gpu_fallback = [&]() {
         return is_dsv4
@@ -11567,8 +11563,18 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
                 return llama_dsv4_spec_ckpt_restore(ctx, ckpt_type, true, accepted_step);
             }
-            if (seq_id < 0 || !kv.per_step_restore(ctx->sched, ckpt_type, accepted_step, (uint32_t) seq_id)) {
+            if (seq_id < 0) {
                 return LLAMA_SPEC_CKPT_RESTORE_FAILED;
+            }
+            if (!kv.per_step_restore(ctx->sched, ckpt_type, accepted_step, (uint32_t) seq_id)) {
+                // This slot's per-step snapshot was never captured (the capture path
+                // records one slot into the shared checkpoint). Roll back its KV and let
+                // the base replay recompute the KDA conv/ssm state for the short draft
+                // window rather than failing the slot.
+                LLAMA_LOG_INFO("%s: no per-step snapshot for seq %d, rolling back KV for base replay\n",
+                        __func__, (int) seq_id);
+                llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
+                return LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED;
             }
             const llama_pos accepted_pos = n_past + accepted_step;
             if (seq_id >= 0 && (uint32_t)seq_id < kv.size) {
@@ -11629,11 +11635,18 @@ void llama_spec_ckpt_discard(struct llama_context * ctx, llama_ckpt_data ckpt_ty
 
     const int32_t n_spec = (int32_t) kv.ckpt_spec_pool.size();
     if (ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_PER_STEP) {
+        // Several slots can be mid-restore against the same shared checkpoint. Only mark
+        // the saved snapshots stale; leave the shared mode and the per-seq objects in
+        // place. The mode is re-set by llama_spec_ckpt_init on the next save, and the
+        // per-seq objects are reused, so nothing here needs to be torn down.
         kv.save_per_step_ssm = false;
         for (int32_t s = 0; s < n_spec; ++s) {
-            kv.checkpoint_delete(ckpt_type, (llama_seq_id) s);
+            if ((size_t) s < kv.ckpt_spec_pool.size() && kv.ckpt_spec_pool[s]) {
+                kv.ckpt_spec_pool[s]->saved = false;
+            }
         }
-        kv.checkpoint_delete(ckpt_type);
+        ckpt.saved = false;
+        return;
     } else if (ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_GPU_FALLBACK &&
                !llm_arch_is_dsv4(ctx->model.arch)) {
         for (int32_t s = 0; s < n_spec; ++s) {
