@@ -499,6 +499,11 @@ struct gpt_params {
     bool scheduler_async   = false; // if true, in split mode graph the scheduler will use multiple threads to evaluate the graph
     int  fused_delta_net   = 0;     // use fused delta-net if number of tokens in the batch is less than this value
     bool has_mtp           = false; // enable MTP if supported by the model
+    // Allow speculative stages (MTP and anything else in the chain) to run with
+    // n_parallel > 1. Each slot gets its own common_speculative instance, so the
+    // state is already per-slot; this opts out of the conservative single-slot
+    // guard. Off by default: verify accept rates and outputs before relying on it.
+    bool spec_parallel     = false;
 
     std::string cache_type_k = "f16"; // KV cache data type for the K
     std::string cache_type_v = "f16"; // KV cache data type for the V

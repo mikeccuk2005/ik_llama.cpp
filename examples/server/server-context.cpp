@@ -262,11 +262,11 @@ bool server_context::load_model(const gpt_params& params_) {
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
 
-    if (!common_speculative_prepare_startup(params_base, false)) {
+    if (!common_speculative_prepare_startup(params_base, params_base.spec_parallel)) {
         return false;
     }
 
-    if (server_speculative_requires_single_slot(params_base.speculative) && params_base.n_parallel > 1) {
+    if (!params_base.spec_parallel && server_speculative_requires_single_slot(params_base.speculative) && params_base.n_parallel > 1) {
         LOG_ERROR("Speculative decoding is currently limited to a single server slot: restart with -np 1, or drop the --spec-type stage(s) to keep parallel slots.\n", {
             {"n_parallel", params_base.n_parallel},
             {"stage_chain", common_speculative_stage_chain_to_str(params_base.speculative)},
