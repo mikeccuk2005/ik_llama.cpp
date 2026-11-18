@@ -7696,7 +7696,18 @@ static int llama_decode_internal(
             }
         }
 
-        if (!already_grouped) {
+        // Regrouping permutes batch.logits along with the tokens. The server caches,
+        // per slot, the batch index of that slot's last token and later looks it up
+        // with llama_get_logits_ith(), so a sparse flag set (one per sequence) must
+        // not be permuted: index 2 would then hold a token whose flag is false and
+        // the lookup aborts. Only regroup when every token carries a flag, or none do.
+        // Only regroup when the caller asked for no logits at all. A speculative
+        // verification batch flags every drafted token, and the server then looks up
+        // its per-slot index with llama_get_logits_ith(); permuting dense flags
+        // invalidates that index just as surely as permuting sparse ones does.
+        const bool permute_safe = !batch_all.logits;
+
+        if (permute_safe && !already_grouped) {
             std::vector<int32_t> perm(n_tokens_all);
             for (uint32_t i = 0; i < n_tokens_all; ++i) {
                 perm[i] = (int32_t) i;
@@ -14064,7 +14075,8 @@ float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
 
         return ctx->logits + j*ctx->model.hparams.n_vocab;
     } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
+        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s (n_outputs=%d, output_ids=%zu)\n",
+                __func__, i, err.what(), ctx->n_outputs, ctx->output_ids.size());
 #ifndef NDEBUG
         GGML_ABORT("fatal error");
 #endif

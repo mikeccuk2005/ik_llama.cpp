@@ -531,6 +531,13 @@ static llama_token llama_sampling_sample_impl(
 
     llama_token id = 0;
     float * logits = llama_get_logits_ith(ctx_main, idx);
+    if (logits == nullptr) {
+        // A stale index (speculative verification batches rebuild output_ids per
+        // decode) used to dereference null here and kill the process. Fail the
+        // sample instead so the request errors and the server stays up.
+        LOG_ERR("%s: no logits for idx=%d, skipping sample\n", __func__, idx);
+        return 0;
+    }
     // apply reasoning budget first
     common_reasoning_budget_apply(rbudget, &cur_p);
     // Sample grammar first for resampling
