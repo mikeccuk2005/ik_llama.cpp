@@ -268,6 +268,20 @@ struct common_sampler {
 
     llama_token_data_array cur_p; // current candidates
 
+    // Optional override for the logits rows to sample from. Set by the server when a
+    // slot's drafted tokens were decoded in an earlier batch: by the time accept runs,
+    // other slots may have decoded and the live context's output mapping no longer
+    // matches these tokens. nullptr means read from the context as usual.
+    const float * external_logits = nullptr;
+    // Batch position that row 0 of external_logits corresponds to, and total bytes in the
+    // buffer. prepare_impl maps a requested batch idx to row (idx - external_logits_base).
+    int32_t external_logits_base = 0;
+    size_t  external_logits_size = 0;
+    // Mutable copy of external_logits. Sampling mutates the logits in place (logit_bias,
+    // guidance, repetition penalties), so work on this buffer rather than the read-only
+    // source. Sized n_vocab when external_logits is set.
+    std::vector<float> external_logits_scratch;
+
     std::mt19937 rng;
     uint32_t speculative_seed = LLAMA_DEFAULT_SEED;
     std::mt19937 speculative_rng;

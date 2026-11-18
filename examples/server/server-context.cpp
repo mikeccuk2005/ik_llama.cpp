@@ -4630,6 +4630,15 @@ void server_context::speculative_decoding_accept() {
             ban_set_ptr = &ban_set;
         }
 
+        // The drafted tokens were decoded in an earlier batch; by now another slot may have
+        // decoded and the live output mapping no longer matches these indices. If we captured
+        // the rows right after the verification decode, sample from those bytes instead.
+        const bool have_cache = !slot.logits_cache.empty() && slot.logits_cache.size() >= slot.i_batch_dft.size() * (size_t) llama_n_vocab(model);
+        if (have_cache) {
+            slot.ctx_sampling->external_logits      = slot.logits_cache.data();
+            slot.ctx_sampling->external_logits_base = slot.i_batch_dft.front();
+            slot.ctx_sampling->external_logits_size = slot.logits_cache.size() * sizeof(float);
+        }
         try {
             ids = slot.draft_proposal_dists.empty()
                 ? common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted, false, ban_set_ptr)
@@ -4641,6 +4650,8 @@ void server_context::speculative_decoding_accept() {
                 {"error", e.what()},
             });
             send_error(slot, std::string("sampling error: ") + e.what(), ERROR_TYPE_SERVER);
+            slot.ctx_sampling->external_logits      = nullptr;
+            slot.ctx_sampling->external_logits_size = 0;
             slot.release();
             slot.i_batch = -1;
             slot.i_batch_dft.clear();
@@ -4648,6 +4659,9 @@ void server_context::speculative_decoding_accept() {
             slot.draft_proposal_dists.clear();
             continue;
         }
+
+        slot.ctx_sampling->external_logits      = nullptr;
+        slot.ctx_sampling->external_logits_size = 0;
 
         std::vector<int32_t> accepted_output_indices;
         if (server_speculative_uses_target_features(slot.params.speculative)) {

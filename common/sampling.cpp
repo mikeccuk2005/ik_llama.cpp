@@ -530,7 +530,11 @@ static llama_token llama_sampling_sample_impl(
     auto & rbudget = ctx_sampling->rbudget;
 
     llama_token id = 0;
-    float * logits = llama_get_logits_ith(ctx_main, idx);
+    // prepare_impl already resolved the row into the scratch buffer (or returned an empty
+    // cur_p) when external_logits is set; reuse it rather than re-fetching.
+    float * logits = ctx_sampling->external_logits != nullptr
+        ? (ctx_sampling->cur_p.data != nullptr ? ctx_sampling->external_logits_scratch.data() : nullptr)
+        : llama_get_logits_ith(ctx_main, idx);
     if (logits == nullptr) {
         // A stale index (speculative verification batches rebuild output_ids per
         // decode) used to dereference null here and kill the process. Fail the
@@ -582,8 +586,10 @@ static llama_token llama_sampling_sample_impl(
     }
 
     if (ctx_sampling->grammar != NULL && !grammar_first && grammar_should_apply(ctx_sampling)) {
-        // Get a pointer to the logits
-        float * logits = llama_get_logits_ith(ctx_main, idx);
+        // Get a pointer to the logits (same row prepare_impl already resolved)
+        float * logits = ctx_sampling->external_logits != nullptr
+            ? ctx_sampling->external_logits_scratch.data()
+            : llama_get_logits_ith(ctx_main, idx);
 
         // Create an array with a single token data element for the sampled id
         llama_token_data single_token_data = {id, logits[id], 0.0f};
@@ -631,8 +637,32 @@ static llama_token_data_array llama_sampling_prepare_impl(
     auto & prev = ctx_sampling->prev;
     auto & cur  = ctx_sampling->cur;
 
-    // Get a pointer to the logits
-    float * logits = llama_get_logits_ith(ctx_main, idx);
+    // Get a pointer to the logits. When the server supplied an external row (the drafted
+    // tokens were decoded in an earlier batch and the live mapping no longer matches them),
+    // copy it into the scratch buffer and work on that: sampling mutates the logits in
+    // place and the source is read-only.
+    float * logits;
+    if (ctx_sampling->external_logits != nullptr) {
+        // Row k of the drafted batch corresponds to batch position external_logits_base + k.
+        const int64_t k = (int64_t) idx - ctx_sampling->external_logits_base;
+        if (k < 0 || (size_t)(k + 1) * (size_t) n_vocab > ctx_sampling->external_logits_size) {
+            LOG_ERR("%s: external logits row %d out of range (base=%d, size=%zu, n_vocab=%d)\n",
+                    __func__, (int) k, ctx_sampling->external_logits_base,
+                    ctx_sampling->external_logits_size, n_vocab);
+            ctx_sampling->cur_p = { nullptr, 0, false };
+            return ctx_sampling->cur_p;
+        }
+        const float * row = ctx_sampling->external_logits + (size_t) k * (size_t) n_vocab;
+        ctx_sampling->external_logits_scratch.assign(row, row + n_vocab);
+        logits = ctx_sampling->external_logits_scratch.data();
+    } else {
+        logits = llama_get_logits_ith(ctx_main, idx);
+    }
+    if (logits == nullptr) {
+        LOG_ERR("%s: no logits for idx=%d\n", __func__, idx);
+        ctx_sampling->cur_p = { nullptr, 0, false };
+        return ctx_sampling->cur_p;
+    }
 
     if (ctx_sampling->grammar != NULL && !grammar_first) {
         GGML_ASSERT(original_logits != NULL);
