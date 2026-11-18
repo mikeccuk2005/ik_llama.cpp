@@ -11369,6 +11369,16 @@ int llama_spec_ckpt_init(struct llama_context * ctx, llama_ckpt_data ckpt_type, 
     int resolved = LLAMA_SPEC_CKPT_NONE;
 
     const auto prepare_per_step = [&]() {
+        // Per-step snapshots are indexed by step alone, so they hold one sequence's
+        // rows. With several slots live a snapshot taken for one slot would be
+        // restored into another. The whole-state shadow path copies the complete
+        // multi-seq state instead, which is already correct, so decline here and let
+        // AUTO fall through to it.
+        if (llama_n_seq_max(ctx) > 1) {
+            LLAMA_LOG_INFO("%s: %u sequences, per-step snapshots are single-sequence; using whole-state shadows\n",
+                    __func__, llama_n_seq_max(ctx));
+            return false;
+        }
         return is_dsv4
             ? llama_dsv4_spec_ckpt_prepare(ctx, ckpt_type, LLAMA_SPEC_CKPT_PER_STEP, max_tokens)
             : spec_ckpt_try_per_step(kv, ctx->model, ckpt_type, max_tokens, llama_n_seq_max(ctx));
@@ -11437,9 +11447,13 @@ int llama_spec_ckpt_init(struct llama_context * ctx, llama_ckpt_data ckpt_type, 
 
 bool llama_spec_ckpt_save(struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id) {
     auto & kv = ctx->kv_self;
-    auto & ckpt = kv.llama_get_ckpt(ckpt_type, seq_id);
-    ckpt.selected_spec_mode = kv.llama_get_ckpt(ckpt_type).selected_spec_mode;
-
+    // Per-step snapshots hold one sequence's rows, so they need a per-sequence
+    // object. Whole-state shadows copy every sequence at once, so one shared object
+    // is both correct and far cheaper (a shadow set is ~6.8 GB).
+    const int spec_mode_sel = kv.llama_get_ckpt(ckpt_type).selected_spec_mode;
+    const llama_seq_id ckpt_seq = spec_mode_sel == LLAMA_SPEC_CKPT_PER_STEP ? seq_id : (llama_seq_id) -1;
+    auto & ckpt = kv.llama_get_ckpt(ckpt_type, ckpt_seq);
+    ckpt.selected_spec_mode = spec_mode_sel;
     switch (ckpt.selected_spec_mode) {
         case LLAMA_SPEC_CKPT_PER_STEP:
             if (llm_arch_is_dsv4(ctx->model.arch)) {
@@ -11452,7 +11466,7 @@ bool llama_spec_ckpt_save(struct llama_context * ctx, llama_ckpt_data ckpt_type,
             if (llm_arch_is_dsv4(ctx->model.arch)) {
                 return llama_dsv4_spec_ckpt_save(ctx, ckpt_type, true);
             }
-            return kv.checkpoint_save(ctx->sched, ckpt_type, seq_id);
+            return kv.checkpoint_save(ctx->sched, ckpt_type, ckpt_seq);
 
         case LLAMA_SPEC_CKPT_CPU: {
             if (llm_arch_is_dsv4(ctx->model.arch)) {
@@ -11528,9 +11542,13 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
         struct llama_context * ctx, llama_ckpt_data ckpt_type, llama_seq_id seq_id,
         llama_pos n_past, int accepted_step) {
     auto & kv = ctx->kv_self;
-    auto & ckpt = kv.llama_get_ckpt(ckpt_type, seq_id);
-    ckpt.selected_spec_mode = kv.llama_get_ckpt(ckpt_type).selected_spec_mode;
-
+    // Per-step snapshots hold one sequence's rows, so they need a per-sequence
+    // object. Whole-state shadows copy every sequence at once, so one shared object
+    // is both correct and far cheaper (a shadow set is ~6.8 GB).
+    const int spec_mode_sel = kv.llama_get_ckpt(ckpt_type).selected_spec_mode;
+    const llama_seq_id ckpt_seq = spec_mode_sel == LLAMA_SPEC_CKPT_PER_STEP ? seq_id : (llama_seq_id) -1;
+    auto & ckpt = kv.llama_get_ckpt(ckpt_type, ckpt_seq);
+    ckpt.selected_spec_mode = spec_mode_sel;
     switch (ckpt.selected_spec_mode) {
         case LLAMA_SPEC_CKPT_PER_STEP: {
             if (llm_arch_is_dsv4(ctx->model.arch)) {
@@ -11554,7 +11572,7 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
                 return llama_dsv4_spec_ckpt_restore(ctx, ckpt_type, true, 0);
             }
-            if (!kv.checkpoint_restore(ctx->sched, ckpt_type, seq_id)) {
+            if (!kv.checkpoint_restore(ctx->sched, ckpt_type, ckpt_seq)) {
                 return LLAMA_SPEC_CKPT_RESTORE_FAILED;
             }
             llama_kv_cache_seq_rm(kv, seq_id, n_past, -1);
