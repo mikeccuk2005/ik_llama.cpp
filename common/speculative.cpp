@@ -2168,6 +2168,17 @@ bool common_speculative_prepare_mtp_runtime(
         return false;
     }
 
+    // MTP heads are trained up to the target's context window. Past that the draft
+    // proposes positions the head never saw: no acceptance, degraded output, extra
+    // work. Remove the stage instead of running it out of range.
+    const int32_t mtp_ctx = (int32_t) llama_n_ctx_train(model);
+    if (mtp_ctx > 0 && params_base.n_ctx > mtp_ctx) {
+        LOG_WRN("%s: -c %d exceeds the MTP supported context of %d, removing the MTP stage\n",
+                __func__, params_base.n_ctx, mtp_ctx);
+        params.remove_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
+        return false;
+    }
+
     const enum llama_mtp_package target_package = llama_model_mtp_package(model);
     const bool has_embedded_mtp = target_package == LLAMA_MTP_PACKAGE_EMBEDDED;
     if (target_package == LLAMA_MTP_PACKAGE_COMPANION ||
