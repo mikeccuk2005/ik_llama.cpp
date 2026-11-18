@@ -292,18 +292,25 @@ struct llama_kv_cache {
     std::map<llama_pos, gpu_checkpoint *> ckpt_rewind_map;
     std::vector<std::unique_ptr<gpu_checkpoint>> ckpt_rewind_pool;
 
-    bool checkpoint_alloc_shadows(llama_ckpt_data ckpt_type, bool conv_only_shadow = false);
+    // Per-sequence speculative checkpoints, indexed by seq_id. The single `ckpt`
+    // above is keyed by type only, which is right for rewind but wrong for spec:
+    // with several slots live they would save and restore one shared object and
+    // mix each other's per-step snapshots.
+    std::vector<std::unique_ptr<gpu_checkpoint>> ckpt_spec_pool;
+
+    bool checkpoint_alloc_shadows(llama_ckpt_data ckpt_type, bool conv_only_shadow = false, llama_seq_id seq_id = -1);
     bool checkpoint_supported() const;
-    bool checkpoint_save(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type);
-    bool checkpoint_restore(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type);
-    void checkpoint_delete(llama_ckpt_data ckpt_type);
+    bool checkpoint_save(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type, llama_seq_id seq_id = -1);
+    bool checkpoint_restore(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type, llama_seq_id seq_id = -1);
+    void checkpoint_delete(llama_ckpt_data ckpt_type, llama_seq_id seq_id = -1);
 
-    gpu_checkpoint & llama_get_ckpt(llama_ckpt_data ckpt_type);
+    gpu_checkpoint & llama_get_ckpt(llama_ckpt_data ckpt_type, llama_seq_id seq_id = -1);
 
-    bool llama_ckpt_mode_equal(llama_ckpt_data ckpt_type, int mode) const;
+    bool llama_ckpt_mode_equal(llama_ckpt_data ckpt_type, int mode, llama_seq_id seq_id = -1) const;
 
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
-    bool per_step_alloc(const llama_model & model, int max_tokens);
+    bool per_step_alloc(const llama_model & model, int max_tokens, uint32_t n_seq = 1);
+    bool per_step_alloc_ckpt(const llama_model & model, int max_tokens, gpu_checkpoint & ckpt);
     bool per_step_restore(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type, int step, uint32_t slot);
 
     ~llama_kv_cache() {
