@@ -3809,6 +3809,8 @@ void server_context::add_sampled_tokens() {
                 slot.drafted.clear();
                 slot.draft_proposal_dists.clear();
                 slot.i_batch_dft.clear();
+                // the cached draft rows no longer describe this token
+                slot.logits_cache.clear();
             } else {
                 if (slot.spec_target_only) {
                     SLT_DBG(slot, "%s\n", "selected DFlash target-only arm: root-only target batch");

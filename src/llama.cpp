@@ -11380,12 +11380,15 @@ int llama_spec_ckpt_init(struct llama_context * ctx, llama_ckpt_data ckpt_type, 
     int resolved = LLAMA_SPEC_CKPT_NONE;
 
     const auto prepare_per_step = [&]() {
-        // llama_n_seq_max() returns the KV cell count, not the slot count; use
-        // cparams.n_seq_max (the -np value) to decide. Per-step restores one sequence's
-        // rows by step and is the only mechanism that isolates slots, so it is preferred
-        // whenever more than one slot can speculate. The whole-state shadow restores the
-        // complete cache and cannot represent different per-slot rollback points.
+        // Use the real slot count (-np), not llama_n_seq_max() which returns the KV cell
+        // count. Per-step is only worth attempting when several slots can speculate: its
+        // KDA snapshot/restore is unreliable for this hybrid model (it returns success but
+        // leaves the recurrent state wrong, corrupting generation), so a single slot must
+        // stay on the whole-state shadow path, which is correct.
         const uint32_t n_seq = std::max<uint32_t>(1, ctx->cparams.n_seq_max);
+        if (n_seq <= 1) {
+            return false;
+        }
         return is_dsv4
             ? llama_dsv4_spec_ckpt_prepare(ctx, ckpt_type, LLAMA_SPEC_CKPT_PER_STEP, max_tokens)
             : spec_ckpt_try_per_step(kv, ctx->model, ckpt_type, max_tokens, n_seq);
@@ -11635,18 +11638,25 @@ void llama_spec_ckpt_discard(struct llama_context * ctx, llama_ckpt_data ckpt_ty
 
     const int32_t n_spec = (int32_t) kv.ckpt_spec_pool.size();
     if (ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_PER_STEP) {
-        // Several slots can be mid-restore against the same shared checkpoint. Only mark
-        // the saved snapshots stale; leave the shared mode and the per-seq objects in
-        // place. The mode is re-set by llama_spec_ckpt_init on the next save, and the
-        // per-seq objects are reused, so nothing here needs to be torn down.
+        // With a single slot there is no other slot whose in-flight restore depends on the
+        // shared checkpoint, so do the full teardown. With several slots one slot's discard
+        // must not delete the snapshots the others still need: only mark the saved snapshots
+        // stale and leave the shared mode and per-seq objects for the next save to reuse.
         kv.save_per_step_ssm = false;
-        for (int32_t s = 0; s < n_spec; ++s) {
-            if ((size_t) s < kv.ckpt_spec_pool.size() && kv.ckpt_spec_pool[s]) {
-                kv.ckpt_spec_pool[s]->saved = false;
+        const uint32_t n_slots = std::max<uint32_t>(1, ctx->cparams.n_seq_max);
+        if (n_slots > 1) {
+            for (int32_t s = 0; s < n_spec; ++s) {
+                if ((size_t) s < kv.ckpt_spec_pool.size() && kv.ckpt_spec_pool[s]) {
+                    kv.ckpt_spec_pool[s]->saved = false;
+                }
             }
+            ckpt.saved = false;
+            return;
         }
-        ckpt.saved = false;
-        return;
+        for (int32_t s = 0; s < n_spec; ++s) {
+            kv.checkpoint_delete(ckpt_type, (llama_seq_id) s);
+        }
+        kv.checkpoint_delete(ckpt_type);
     } else if (ckpt.selected_spec_mode == LLAMA_SPEC_CKPT_GPU_FALLBACK &&
                !llm_arch_is_dsv4(ctx->model.arch)) {
         for (int32_t s = 0; s < n_spec; ++s) {
