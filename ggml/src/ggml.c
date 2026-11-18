@@ -18799,7 +18799,7 @@ static int ggml_compute_forward_mul_mat(
     if (dst->type == GGML_TYPE_F32) {
         {
             static int dbg_mm = 0;
-            if (getenv("GGML_MM_DEBUG") && dbg_mm < 12) {
+            if (getenv("GGML_MM_DEBUG") && dbg_mm < 100000) {
                 dbg_mm++;
                 fprintf(stderr, "mm[%d]: ne01=%lld ne11=%lld ne00=%lld ne12=%lld ith=%d nth=%d src1=%s\n",
                         dbg_mm, (long long)ne01, (long long)ne11, (long long)ne00,
@@ -18874,14 +18874,43 @@ static int ggml_compute_forward_mul_mat(
 
     const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
 
+    // Mixed-engine column split (decision shared with iqk via iqk_amx_split_plan).
+    // ggml drives it here rather than inside the iqk call because both halves must
+    // stay inside ONE barrier sequence. The iqk path returns early and skips the
+    // barrier below, which is what hung the graph: the AMX group and the vec_dot
+    // group ended up blocked at different barriers.
+    int64_t mm_na    = 0;      // columns [0, mm_na) belong to AMX
+    int     mm_nth_a = nth;    // threads [0, mm_nth_a) drive AMX
+    bool    mm_split = false;
+
     if (src1->type != vec_dot_type && dst->type == GGML_TYPE_F32) {
+#ifdef GGML_AMX
+        mm_split = iqk_amx_split_plan(ne01, ne11, ne00, src0->type, vec_dot_type,
+                                      nth, &mm_na, &mm_nth_a);
+#endif
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-        if (iqk_mul_mat_4d(ne01, ne11, ne00,
+        bool iqk_ok = false;
+        // With the split active only the AMX group enters the iqk path; the other
+        // group computes the high columns with ggml's own vec_dot below.
+        if (!mm_split || ith < mm_nth_a) {
+            iqk_ok = iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, row_size*ne11, row_size*ne11*ne12,
                     nb2/sizeof(float), nb3/sizeof(float),
                     src0->type, src0->data, nb01,
                     vec_dot_type, wdata, row_size,
-                    (float *)dst->data, nb1/sizeof(float), ith, nth)) {
+                    (float *)dst->data, nb1/sizeof(float), ith, nth);
+        }
+        if (iqk_ok) {
+            if (mm_split) {
+                // AMX has done its columns; join the barrier the vec_dot group is
+                // waiting at, then leave the node. Fusion is skipped for split
+                // nodes, which keeps the barrier pairing exact.
+                if (ith == 0) {
+                    atomic_store(&params->shared->current_chunk, nth - mm_nth_a);
+                }
+                ggml_barrier(params->shared);
+                return node_n;
+            }
             if (!cgraph) return node_n;
             while (node_n < cgraph->n_nodes - 1 &&
                    cgraph->nodes[node_n+1]->op == GGML_OP_MUL_MAT &&
@@ -18905,13 +18934,22 @@ static int ggml_compute_forward_mul_mat(
         // no IQK kernel: fall through to the generic vec_dot path
     }
 
-    if (ith == 0) {
-        atomic_store(&params->shared->current_chunk, nth);
+    // With the mixed-engine split the vec_dot group owns only the high columns;
+    // the AMX group is already parked in this barrier and leaves right after it.
+    const int64_t mm_base = mm_split ? mm_na : 0;
+    const int     mm_nth  = mm_split ? (nth - mm_nth_a) : nth;
+    const int     mm_ith  = mm_split ? (ith - mm_nth_a) : ith;
+
+    if (ith == (mm_split ? mm_nth_a : 0)) {
+        atomic_store(&params->shared->current_chunk, mm_nth);
     }
     ggml_barrier(params->shared);
 
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;
+    // Columns this group still owns. Equals nr0 unless the mixed-engine split
+    // handed [0, mm_base) to AMX.
+    const int64_t nr0span = nr0 - mm_base;
 
     // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
@@ -18920,7 +18958,7 @@ static int ggml_compute_forward_mul_mat(
     int64_t num_rows_per_vec_dot = vec_dot_num_rows;
     // TODO: currently the mmla kernels support only even numbered rows/cols.
     // this check can be removed once they are extended to support odd numbered rows/cols too
-    if ((nr0 % 2 != 0) || (ne11 % 2 != 0)) {
+    if ((nr0span % 2 != 0) || (ne11 % 2 != 0) || (mm_base % 2 != 0)) {
         num_rows_per_vec_dot = 1;
     }
 
@@ -18928,30 +18966,30 @@ static int ggml_compute_forward_mul_mat(
     int chunk_size = 16;
 
     // We need to step up the size if it's small
-    if (nr0 == 1 || nr1 == 1) {
+    if (nr0span == 1 || nr1 == 1) {
         chunk_size = 64;
     }
 
     // distribute the work across the inner or outer loop based on which one is larger
     // The number of chunks in the 0/1 dim.
     // CEIL(nr0/chunk_size)
-    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+    int64_t nchunk0 = (nr0span + chunk_size - 1) / chunk_size;
     int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
     // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggerganov/llama.cpp/pull/6915
     //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
+    if (nchunk0 * nchunk1 < mm_nth * 4 || ggml_is_numa()) {
         // distribute the thread work across the inner or outer loop based on which one is larger
-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+        nchunk0 = nr0span > nr1 ? mm_nth : 1; // parallelize by src0 rows
+        nchunk1 = nr0span > nr1 ? 1 : mm_nth; // parallelize by src1 rows
     }
 
     // The number of elements in each chunk
-    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+    const int64_t dr0 = (nr0span + nchunk0 - 1) / nchunk0;
     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
-    if ((ggml_n_dims(src0) == 2) && gemv) {
+    if (!mm_split && (ggml_n_dims(src0) == 2) && gemv) {
         const void * src1_wdata      = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t src1_col_stride = ggml_is_contiguous(src1) || src1->type != vec_dot_type ? ggml_row_size(vec_dot_type, ne10) : nb11;
         int64_t src0_start = (ith * ne01) / nth;
@@ -18974,21 +19012,23 @@ static int ggml_compute_forward_mul_mat(
     }
 
     // The first chunk comes from our thread_id, the rest will get auto-assigned.
-    int current_chunk = ith;
+    int current_chunk = mm_ith;
 
     while (current_chunk < nchunk0 * nchunk1) {
         const int64_t ith0 = current_chunk % nchunk0;
         const int64_t ith1 = current_chunk / nchunk0;
 
-        const int64_t ir0_start = dr0 * ith0;
-        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+        // Index inside our own column span; mm_base shifts it to absolute columns.
+        const int64_t ir0_s = dr0 * ith0;
+        const int64_t ir0_e = MIN(ir0_s + dr0, nr0span);
 
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, num_rows_per_vec_dot,
+                ir0_s + mm_base, ir0_e + mm_base, ir1_start, ir1_end);
 
-        if (nth >= nchunk0 * nchunk1) {
+        if (mm_nth >= nchunk0 * nchunk1) {
             break;
         }
 

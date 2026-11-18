@@ -70,6 +70,14 @@ std::atomic<long long> g_builds{0};
 std::atomic<long long> g_fast{0};
 std::atomic<long long> g_path_ns{0};
 std::atomic<long long> g_quant_ns{0};
+std::atomic<long long> g_lookup_hit{0};
+std::atomic<long long> g_lookup_miss{0};
+std::atomic<long long> g_lookup_mu_ns{0};
+// Own counters here rather than externs into iqk_amx_blocked.cpp: those live in
+// that file's anonymous namespace, so declaring them extern produced an
+// undefined-symbol link error (R_X86_64_PC32 against _ZN12_GLOBAL__N_1...).
+static std::atomic<long long> g_epi_ns{0};
+static std::atomic<long long> g_epi_elems{0};
 std::atomic<long long> g_lookup_ns{0};
 std::atomic<long long> g_quantloop_ns{0};
 std::atomic<long long> g_wide_calls{0};
@@ -114,8 +122,9 @@ __attribute__((constructor)) void amx_stats_register() {
             const double mb = (double)sizeof(float) * kq * rowsq * reps / 1e6;
             fprintf(stderr, "wide: calls=%lld ns_s=%.1f ny_max=%lld\n",
                     g_wide_calls.load(), g_wide_ns.load() / 1e9, g_ny_max.load());
-            fprintf(stderr, "split: lookup_s=%.1f quantloop_s=%.1f\n",
-                    g_lookup_ns.load() / 1e9, g_quantloop_ns.load() / 1e9);
+            fprintf(stderr, "split: lookup_s=%.1f quantloop_s=%.1f hit=%lld miss=%lld miss_s=%.1f\n",
+                    g_lookup_ns.load() / 1e9, g_quantloop_ns.load() / 1e9,
+                    g_lookup_hit.load(), g_lookup_miss.load(), g_lookup_mu_ns.load() / 1e9);
             {
                 // Vector path against the scalar reference, element by element,
                 // on data shaped like real activations (a few large magnitudes).
@@ -295,48 +304,67 @@ std::unordered_map<ShadowKey, std::shared_ptr<std::mutex>, ShadowKeyHash> g_buil
 // slot is fingerprinted so a recycled activation buffer is never mistaken for
 // the previous layer's data.
 struct AqShared {
-    // Park, do not spin. Measured at 128 threads: a spin barrier cost 5%
-    // (230.6 against 244.2) because waiters fight the workers for cores. The
-    // futex wakeup was never the ceiling. done and next_panel still get their
-    // own cache lines: both are written by every thread.
+    // Row quantisation shared across the team, one slot per (B, ny, k, data
+    // fingerprint). A generation counter makes a slot safe to reuse: the last
+    // arriver of a generation resets the arrival and panel counters and bumps
+    // the generation; waiters park until the generation advances. The parked
+    // wait measured better than a spin rendezvous at 128 threads.
     std::mutex m;
     std::condition_variable cv;
     alignas(64) std::atomic<int> done{0};
-    alignas(64) std::atomic<int> next_panel{0};   // per matmul, one reset
-    std::atomic<bool> ready{false};
+    alignas(64) std::atomic<int> gen{0};
+    alignas(64) std::atomic<int> next_panel{0};   // per generation, reset by the last arriver
+    alignas(64) std::atomic<int> next_tile{0};    // 2D-tiled work-steal, reset per generation
     std::vector<int8_t> q;
     std::vector<float>  s;
 };
 
-std::mutex g_aq_mu;
-std::shared_ptr<AqShared> g_aq;
-const void * g_aq_key = nullptr;
-int g_aq_ny = 0, g_aq_k = 0;
-float g_aq_fp[4] = {0, 0, 0, 0};
+struct AqKey {
+    const void * B;
+    int ny, k;
+    uint32_t fp[4];
+    bool operator==(const AqKey & o) const {
+        return B == o.B && ny == o.ny && k == o.k &&
+               fp[0] == o.fp[0] && fp[1] == o.fp[1] &&
+               fp[2] == o.fp[2] && fp[3] == o.fp[3];
+    }
+};
+struct AqKeyHash {
+    size_t operator()(const AqKey & k) const {
+        uint64_t h = (uint64_t)(uintptr_t) k.B;
+        h ^= (uint64_t)(uint32_t) k.ny * 0x9E3779B97F4A7C15ULL;
+        h ^= (uint64_t)(uint32_t) k.k  * 0xBF58476D1CE4E5B9ULL;
+        h ^= (uint64_t) k.fp[0] ^ ((uint64_t) k.fp[1] << 32);
+        h ^= (uint64_t) k.fp[2] ^ ((uint64_t) k.fp[3] << 40);
+        h ^= h >> 33; h *= 0xFF51AFD7ED558CCDULL; h ^= h >> 33;
+        return (size_t) h;
+    }
+};
 
-// Sample a few values so we can tell a reused buffer from fresh data.
-static void aq_fingerprint(const void * B, int k, float out[4]) {
+static std::unordered_map<AqKey, std::shared_ptr<AqShared>, AqKeyHash> g_aq_map;
+static std::mutex g_aq_map_mu;
+
+// Sample a few values so a reused buffer can tell fresh data from stale.
+static void aq_fingerprint(const void * B, int k, uint32_t out[4]) {
     const float * f = (const float *) B;
-    out[0] = f[0];
-    out[1] = f[k / 3];
-    out[2] = f[(2 * k) / 3];
-    out[3] = f[k - 1];
+    out[0] = *(const uint32_t *) &f[0];
+    out[1] = *(const uint32_t *) &f[k / 3];
+    out[2] = *(const uint32_t *) &f[(2 * k) / 3];
+    out[3] = *(const uint32_t *) &f[k - 1];
 }
 
 std::shared_ptr<AqShared> aq_slot(const void * B, int ny, int k, size_t need) {
-    float fp[4];
-    aq_fingerprint(B, k, fp);
-    std::lock_guard<std::mutex> lk(g_aq_mu);
-    if (g_aq_key != B || g_aq_ny != ny || g_aq_k != k ||
-        g_aq_fp[0] != fp[0] || g_aq_fp[1] != fp[1] ||
-        g_aq_fp[2] != fp[2] || g_aq_fp[3] != fp[3]) {
-        g_aq = std::make_shared<AqShared>();
-        g_aq->q.resize(need);
-        g_aq->s.resize(need / (size_t)k);
-        g_aq_key = B; g_aq_ny = ny; g_aq_k = k;
-        for (int i = 0; i < 4; i++) g_aq_fp[i] = fp[i];
+    AqKey key{ B, ny, k, {0, 0, 0, 0} };
+    aq_fingerprint(B, k, key.fp);
+    std::lock_guard<std::mutex> lk(g_aq_map_mu);
+    auto it = g_aq_map.find(key);
+    if (it == g_aq_map.end()) {
+        auto s = std::make_shared<AqShared>();
+        s->q.resize(need);
+        s->s.resize(need / (size_t) k);
+        it = g_aq_map.emplace(key, std::move(s)).first;
     }
-    return g_aq;
+    return it->second;
 }
 
 std::shared_ptr<std::mutex> build_mutex_for(const ShadowKey & key) {
@@ -424,8 +452,12 @@ bool quant_row_i8(const float * src, int8_t * dst, int k, float * out_scale) {
 // hot path never touches a mutex or a refcount. Readers key on the tensor
 // pointer, and a slot reused by another tensor simply reads as a miss.
 namespace {
-constexpr int kShadowSlots = 4096;
-struct ShadowSlot {
+// 65536 slots and 64-byte padding: two shadows landing in the same 32-byte slot
+// evict each other on every access, and with expert routing alternating between
+// two hot tensors that turns into a mutex trip per matmul call. At 4096 unpacked
+// slots a 367-shadow model expects ~16 colliding pairs.
+constexpr int kShadowSlots = 1 << 20;
+struct alignas(64) ShadowSlot {
     std::atomic<const void *>    a{nullptr};
     std::atomic<int>             nx{0};
     std::atomic<int>             k{0};
@@ -433,9 +465,35 @@ struct ShadowSlot {
 };
 ShadowSlot g_slots[kShadowSlots];
 
+// One helper, used by both the probe and the publish, so the two can never
+// disagree. The old inline hash was ((A>>6) * PRIME) ^ (nx*131 + k). Expert
+// weights are slices of one 3D stack, so their pointers differ only by the
+// expert stride, and nx and k are identical across the stack. That stride shares
+// large factors with the power-of-two table size, so a whole 512-expert stack
+// collapsed into a few slots and evicted itself every call: hit=3, miss=23485,
+// 1100 thread-seconds inside the mutex. splitmix64's finalizer avalanches
+// strided pointers properly.
+inline size_t slot_index(const void * A, int nx, int k) {
+    // splitmix64 finalizer is now active (2026-11-17). build_s reports 367 builds
+    // total, one per tensor, so the map holds every shadow and the ~47 ms per
+    // "miss" is the trip to g_mu to re-publish, not a rebuild: 23485 lock
+    // acquisitions in a run that needed 367 builds. The strided expert slices
+    // collapse into a handful of slots under the multiplicative hash below, which
+    // is what forces every call through that mutex. The table is also 16x larger
+    // (2^20). The earlier 20x "regression" from this swap was measured while the
+    // dead join below was still stalling every wide call, so it was not a
+    // measurement of this change.
+    //return (size_t)((((uintptr_t)A >> 6) * 0x9E3779B97F4A7C15ULL
+    //                 ^ (size_t)(nx * 131 + k)) & (kShadowSlots - 1));
+    uint64_t x = (uint64_t)(uintptr_t)A ^ (0x9E3779B97F4A7C15ULL * (uint64_t)(nx * 131 + k));
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ULL;
+    x ^= x >> 27; x *= 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    return (size_t)(x & (kShadowSlots - 1));
+}
+
 void shadow_publish(const void * A, int nx, int k, const ShadowI8 * sh) {
-    const size_t h = (((uintptr_t)A >> 6) * 0x9E3779B97F4A7C15ULL
-                      ^ (size_t)(nx * 131 + k)) & (kShadowSlots - 1);
+    const size_t h = slot_index(A, nx, k);
     g_slots[h].sh.store(sh, std::memory_order_release);
     g_slots[h].nx.store(nx, std::memory_order_relaxed);
     g_slots[h].k.store(k, std::memory_order_relaxed);
@@ -446,13 +504,27 @@ void shadow_publish(const void * A, int nx, int k, const ShadowI8 * sh) {
 // Build (or fetch) the int8 shadow of a Q8_0 weight tensor.
 const ShadowI8 * get_shadow_i8(const void * A, size_t strideA, int nx, int k) {
     const ShadowKey key{ A, nx, k };
-    const size_t h = (((uintptr_t)A >> 6) * 0x9E3779B97F4A7C15ULL
-                      ^ (size_t)(nx * 131 + k)) & (kShadowSlots - 1);
+    const size_t h = slot_index(A, nx, k);
     if (g_slots[h].a.load(std::memory_order_acquire) == A &&
         g_slots[h].nx.load(std::memory_order_relaxed) == nx &&
         g_slots[h].k.load(std::memory_order_relaxed) == k) {
-        if (const ShadowI8 * hit = g_slots[h].sh.load(std::memory_order_acquire)) return hit;
+        if (const ShadowI8 * hit = g_slots[h].sh.load(std::memory_order_acquire)) {
+            g_lookup_hit.fetch_add(1, std::memory_order_relaxed);
+            return hit;
+        }
     }
+    g_lookup_miss.fetch_add(1, std::memory_order_relaxed);
+    // Counts everything below: the map probe under g_mu and, on a true miss, the
+    // build itself (also reported as build_s, which stays small once the model
+    // is warm). If miss is large on a warm model the slot table is thrashing.
+    const auto t_mu0 = std::chrono::steady_clock::now();
+    struct Stopper {
+        std::chrono::steady_clock::time_point t0;
+        ~Stopper() {
+            g_lookup_mu_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+        }
+    } stopper{ t_mu0 };
 
     std::shared_ptr<std::mutex> kmu;
     {
@@ -653,7 +725,7 @@ bool amx_int8_available(void) {
 // C[nx x ny] = W[nx x k] (Q8_0) x B[ny x k]^T, int8 tiles, 16 rows at a time.
 bool amx_mul_mat_i8(int nx, int ny, int k, const void * A, size_t strideA,
                     const float * B, size_t strideB,
-                    float * C, size_t strideC, int ith, int nth) {
+                    float * C, size_t strideC, int ith, int nth, int panel_limit) {
     const auto t_enter = std::chrono::steady_clock::now();
     const ShadowI8 * sh = get_shadow_i8(A, strideA, nx, k);
     if (!sh) return false;
@@ -668,7 +740,13 @@ bool amx_mul_mat_i8(int nx, int ny, int k, const void * A, size_t strideA,
     // thread then owns a few 96-column weight panels, walks every activation
     // band against them, and the team reads each weight exactly once. Slicing
     // by row instead makes every thread stream the entire weight matrix.
-    const int npanels = npad / 96;
+    //
+    // panel_limit lets a caller take only the first N panels, which is how the
+    // mixed-engine path hands the low columns to AMX and leaves the rest to
+    // AVX-512 VNNI. Capping panels (not nx) keeps the shadow keyed on the full
+    // nx, so the split never triggers a runtime shadow rebuild.
+    const int npanels_all = npad / 96;
+    const int npanels = (panel_limit > 0 && panel_limit < npanels_all) ? panel_limit : npanels_all;
 
     // Quantise every activation row once, padded to whole bands.
     // thread_local variables are not captured by [&]: they have static storage
@@ -701,37 +779,59 @@ bool amx_mul_mat_i8(int nx, int ny, int k, const void * A, size_t strideA,
     // worth synchronising.
     if (ny > g_ny_max.load()) g_ny_max.store(ny);
     const auto t_wide0 = std::chrono::steady_clock::now();
-    if (nth > 1 && ny > 16) {
+    // Shared row quantisation is the default again, now that the single-entry
+    // cache is a per-key map. Each thread converts a disjoint slice into one
+    // shared buffer and they meet on a generation counter, which cuts the
+    // quantise work by the thread count; quantise was measured at ~67% of path
+    // time in the redundant local path. GGML_AMX_NOSHARE forces the old local
+    // conversion.
+    static const bool g_amx_shared = getenv("GGML_AMX_NOSHARE") == nullptr;
+    if (nth > 1 && ny > 16 && g_amx_shared) {
         g_wide_calls.fetch_add(1);
         slot = aq_slot(B, ny, k, need);
         const int chunk = (ny + nth - 1) / nth;
         const int lo = ith * chunk;
         const int hi = (lo + chunk < ny) ? (lo + chunk) : ny;
-        for (int r = lo; r < hi; r++) quant_row(r);
-        {
-            // Team join for the wide calls, measured at 3.9 ms each. A spin
-            // loop on an atomic counter was tried and measured worse (231-236
-            // t/s against 245): 128 threads spinning steal cycles from the
-            // threads still converting. The parked wait stays.
-            std::unique_lock<std::mutex> lk(slot->m);
-            slot->done.fetch_add(1);
-            slot->cv.notify_all();
-            if (!slot->cv.wait_for(lk, std::chrono::seconds(2),
-                                   [&] { return slot->done.load() >= nth; })) {
-                lk.unlock();
-                for (int r = 0; r < ny; r++) quant_row(r);
-            }
+        for (int r = lo; r < hi; r++) {
+            const float * b = (const float *)((const char *) B + (size_t) r * strideB);
+            quant_row_i8(b, slot->q.data() + (size_t) r * k, k, &slot->s[r]);
+        }
+        // Zero the padded tail rows (idempotent, any thread may do it).
+        if (rows_pad > ny) {
+            memset(slot->q.data() + (size_t) ny * k, 0, (size_t)(rows_pad - ny) * k);
+            for (int r = ny; r < rows_pad; r++) slot->s[r] = 1.0f;
         }
         aqp = slot->q.data();
         ascp = slot->s.data();
+        // Generation barrier: the last arriver resets the arrival and panel
+        // counters and advances the generation; everyone else parks, with a 2 s
+        // timeout that re-converts everything so a thread that never shows up
+        // costs time but can never hang the graph.
+        {
+            const int my_gen = slot->gen.load(std::memory_order_acquire);
+            if (slot->done.fetch_add(1, std::memory_order_acq_rel) == nth - 1) {
+                slot->next_panel.store(0, std::memory_order_relaxed);
+                slot->next_tile.store(0, std::memory_order_relaxed);
+                slot->done.store(0, std::memory_order_relaxed);
+                slot->gen.fetch_add(1, std::memory_order_release);
+            } else {
+                auto t0 = std::chrono::steady_clock::now();
+                while (slot->gen.load(std::memory_order_acquire) == my_gen) {
+                    if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(2)) {
+                        for (int r = 0; r < ny; r++) {
+                            const float * b = (const float *)((const char *) B + (size_t) r * strideB);
+                            quant_row_i8(b, slot->q.data() + (size_t) r * k, k, &slot->s[r]);
+                        }
+                        break;
+                    }
+                    std::this_thread::yield();
+                }
+            }
+        }
         if (getenv("GGML_AMX_STATS"))
             g_wide_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t_wide0).count();
     } else {
-        // We are already one of the caller's threads and this call owns at most
-        // a band of rows. Submitting that to the shared pool made 128 callers
-        // queue work on the same workers and wait for it, which measured as 85%
-        // of the path's time. Just convert here.
         const auto t_q0 = std::chrono::steady_clock::now();
         for (int r = 0; r < ny; r++) quant_row(r);
         if (getenv("GGML_AMX_STATS"))
@@ -749,46 +849,87 @@ bool amx_mul_mat_i8(int nx, int ny, int k, const void * A, size_t strideA,
     // thread walks one 96-column weight panel, which is 491 KB at K=5120 and
     // stays in its L2 while every band reuses it. The alternative, bands
     // outside panels, streams the whole weight matrix once per 16 rows.
-    auto work_panel = [&](int p) {
+    auto work_band = [&](int p, int band) {
         // The tile config is per-thread, so each pool worker loads it once for
         // the life of the process instead of once per panel. Both tile formats
         // use 16 rows x 64 bytes, so a bf16 call clobbering it is harmless.
         static thread_local bool cfg_ok = false;
         if (!cfg_ok) { ggml_amx_int8_tile_begin(); cfg_ok = true; }
         alignas(64) int32_t acc[16 * 96];
-        for (int band = 0; band < bands; band++) {
-            const int m0 = band * 16;
-            const int mrows = (ny - m0 < 16) ? (ny - m0) : 16;
-            memset(acc, 0, sizeof(acc));
-            ggml_amx_int8_panel_acc(aqp + (size_t)m0 * k, (size_t)k,
-                                    sh->packed.data(), p, k, 0, k, acc, 96);
-            for (int r = 0; r < mrows; r++) {
-                const float as = ascp[m0 + r];
-                float * dst = C + (size_t)(m0 + r) * strideC;
-                const int32_t * row = acc + (size_t)r * 96;
-                const int base = p * 96;
-                const int lim = (base + 96 <= nx) ? 96 : (nx - base);
-                for (int j = 0; j < lim; j++) {
-                    dst[base + j] = as * sh->row_scale[base + j] * (float)row[j];
-                }
+        const int m0 = band * 16;
+        const int mrows = (ny - m0 < 16) ? (ny - m0) : 16;
+        memset(acc, 0, sizeof(acc));
+        ggml_amx_int8_panel_acc(aqp + (size_t)m0 * k, (size_t)k,
+                                sh->packed.data(), p, k, 0, k, acc, 96);
+        // Timed here, not in iqk_amx_blocked.cpp: the live path scales in
+        // this lambda, so the blocked kernel's own epilogue counters read
+        // zero and the real scalar scale pass went unmeasured.
+        const auto t_epi0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < mrows; r++) {
+            const float as = ascp[m0 + r];
+            float * dst = C + (size_t)(m0 + r) * strideC;
+            const int32_t * row = acc + (size_t)r * 96;
+            const int base = p * 96;
+            const int lim = (base + 96 <= nx) ? 96 : (nx - base);
+            for (int j = 0; j < lim; j++) {
+                dst[base + j] = as * sh->row_scale[base + j] * (float)row[j];
             }
+            g_epi_elems.fetch_add(lim, std::memory_order_relaxed);
         }
+        g_epi_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t_epi0).count(), std::memory_order_relaxed);
+    };
+    auto work_panel = [&](int p, int b0, int b1) {
+        for (int band = b0; band < b1; band++) work_band(p, band);
     };
 
+    // 2D cache tiling (opt-in: GGML_AMX_TILE_MB bands and GGML_AMX_TILE_NB
+    // panels per work item). Items are (band_block, panel_block) stolen in
+    // band-block-major order. Inside an item the band loop is OUTER so one
+    // activation band is loaded once and reused across the item's NB panels;
+    // that is the lever that actually cuts activation L3 traffic (~NB x), since
+    // without it every panel streams the full activation (10 MB at 2048 tokens).
+    // The NB panels' weights are re-read per band but stay L2-resident.
+    static const int tile_mb = [] {
+        const char * e = getenv("GGML_AMX_TILE_MB");
+        return e ? std::max(1, atoi(e)) : 1;
+    }();
+    static const int tile_nb = [] {
+        const char * e = getenv("GGML_AMX_TILE_NB");
+        return e ? std::max(1, atoi(e)) : 1;
+    }();
     const auto t_panels = std::chrono::steady_clock::now();
-    if (nth > 1 && slot) {
+    if (nth > 1 && slot && (tile_mb > 1 || tile_nb > 1)) {
+        const int tmb    = std::min(tile_mb, bands);
+        const int tnb    = std::min(tile_nb, npanels);
+        const int nbb    = (bands + tmb - 1) / tmb;
+        const int npb    = (npanels + tnb - 1) / tnb;
+        const int nitems = nbb * npb;
+        for (int t = slot->next_tile.fetch_add(1); t < nitems;
+             t = slot->next_tile.fetch_add(1)) {
+            const int bg = t / npb;
+            const int pg = t - bg * npb;
+            const int b0 = bg * tmb;
+            const int b1 = std::min(b0 + tmb, bands);
+            const int p0 = pg * tnb;
+            const int p1 = std::min(p0 + tnb, npanels);
+            for (int band = b0; band < b1; band++)
+                for (int p = p0; p < p1; p++)
+                    work_band(p, band);
+        }
+    } else if (nth > 1 && slot) {
         // Wider calls: panels outnumber nothing in particular, so a shared
         // counter balances the tail.
         for (int p = slot->next_panel.fetch_add(1); p < npanels;
              p = slot->next_panel.fetch_add(1))
-            work_panel(p);
+            work_panel(p, 0, bands);
     } else if (nth > 1) {
         // One band per call: stride by thread index, touching no shared state.
         // A stride, not a single index, because nx=17408 gives 182 panels which
         // is more than the thread count.
-        for (int p = ith; p < npanels; p += nth) work_panel(p);
+        for (int p = ith; p < npanels; p += nth) work_panel(p, 0, bands);
     } else {
-        amx_parallel_for(npanels, work_panel);
+        amx_parallel_for(npanels, [&](int p) { work_panel(p, 0, bands); });
     }
     if (getenv("GGML_AMX_STATS")) {
         g_path_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -821,9 +962,23 @@ bool iqk_amx_mul_mat_enabled(void) {
 // from inside a compute region serialises on the cache mutex and costs minutes.
 extern "C" void iqk_amx_prewarm(int type, const void * A, size_t strideA, int nx, int k) {
     if (!iqk_amx_mul_mat_enabled()) return;
-    // The band loop fans out with its own parallel for inside the caller's
-    // region, so nesting has to be allowed or those bands run serially.
-    static bool nested_ok = [] { omp_set_max_active_levels(2); return true; }();
+    // Keep this. Removing it was tested as a single variable on the 27B Q8,
+    // np=1, c=8192, ntg=64, 64 threads on node1: with it in the cell finished in
+    // 10.0 s at 6.37 t/s, without it the same cell needed SIGKILL past 200 s,
+    // reproduced twice with the slot hash reverted to the original formula so
+    // the hash was ruled out. The band fan-out really does need nested OpenMP
+    // allowed, even though the nth==1 fan-out goes through the std::thread
+    // AmxWorkPool. Do not judge the need for nesting from that one branch.
+    static bool nested_ok = [] {
+        // The nth==1 band fan-out needs nested OpenMP allowed; removing it once
+        // pushed a 27B cell past 200s (see note above). Kept unconditional so the
+        // default build behaves exactly as before. The mixed-engine column split
+        // does not rely on this (it takes the nth>1 stride branch).
+#if defined(_OPENMP)
+        omp_set_max_active_levels(2);
+#endif
+        return true;
+    }();
     (void)nested_ok;
     if (k % 32 != 0 || nx < 16) return;
     if (type == GGML_TYPE_Q8_0 && k % 64 == 0 && amx_int8_available() && !getenv("GGML_AMX_NO_I8")) {
@@ -838,9 +993,16 @@ extern "C" void iqk_amx_prewarm(int type, const void * A, size_t strideA, int nx
 bool iqk_amx_mul_mat(int nx, int ny, int k,
                      int typeA, const void * A, size_t strideA,
                      const float * B, size_t strideB,
-                     float * C, size_t strideC, int ith, int nth) {
+                     float * C, size_t strideC, int ith, int nth, int panel_limit) {
     if (!iqk_amx_mul_mat_enabled()) return false;
     if (k % 32 != 0 || !type_ok(typeA)) return false;
+    // Decode is one row, below the smallest 16-row band, so it stays on the AVX-512
+    // path (which then hits the +-5% tg bar). Raising this threshold to 48 to
+    // route the MoE expert chunks (~22 rows) to control measured neutral on
+    // pp=2048 (217.3 vs 217.9) and worse on pp=512 (177.8 vs 194.8), so keep 16;
+    // the big attention projections are what AMX serves and they are not the ones
+    // this gate would catch.
+    if (ny < 16) return false;
 
     // Q8_0 weights are already int8, so they take the W8A8 path: byte-identical
     // shadow, no widening, 2x the tile throughput of bf16.
@@ -850,8 +1012,12 @@ bool iqk_amx_mul_mat(int nx, int ny, int k,
     if (!no_i8 && typeA == GGML_TYPE_Q8_0 && k % 64 == 0 && amx_int8_available()) {
         g_calls++;
         g_gmac += (long long)nx * ny * k;
-        if (amx_mul_mat_i8(nx, ny, k, A, strideA, B, strideB, C, strideC, ith, nth)) return true;
+        if (amx_mul_mat_i8(nx, ny, k, A, strideA, B, strideB, C, strideC, ith, nth, panel_limit)) return true;
     }
+
+    // The bf16 fallback walks every output column, so it cannot honour a panel
+    // cap. Decline, and let the caller finish its column slice on AVX-512.
+    if (panel_limit > 0) return false;
 
     std::shared_ptr<const Shadow> sh = get_shadow(typeA, A, strideA, nx, k);
     if (!sh) return false;

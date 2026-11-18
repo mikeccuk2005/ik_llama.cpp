@@ -13,11 +13,19 @@
 
 #include <cstring>
 #include <cfloat>
+#include <cmath>
+#include <cstdio>
+#include <set>
+#include <mutex>
+#include <string>
 #include <type_traits>
 #include <vector>
 #include <new>
 #include <algorithm>
 #include <numeric>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 #include "ggml-impl.h"
 #include "ggml-quants.h"
@@ -673,6 +681,10 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
             return true;
         }
         if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
+            if (getenv("GGML_AMX_DBG")) {
+                fprintf(stderr, "[MMFAIL1] Nx=%ld Ny=%ld ne00=%ld typeA=%d typeB=%d\n", Nx, Ny, ne00, typeA, typeB);
+                fflush(stderr);
+            }
             return false;
         }
         const bool is_float = !mm.func16 && (typeA == GGML_TYPE_F32 || typeA == GGML_TYPE_F16 || typeA == GGML_TYPE_BF16);
@@ -750,6 +762,10 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
     }
 
     if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
+        if (getenv("GGML_AMX_DBG")) {
+            fprintf(stderr, "[MMFAIL2] Nx=%ld Ny=%ld ne00=%ld typeA=%d typeB=%d\n", Nx, Ny, ne00, typeA, typeB);
+            fflush(stderr);
+        }
         return false;
     }
 
@@ -802,10 +818,72 @@ inline uint32_t simple_gcd(uint32_t a, uint32_t b) {
 
 #ifdef GGML_AMX
 bool iqk_amx_mul_mat(int nx, int ny, int k, int typeA, const void * A, size_t strideA,
-                     const float * B, size_t strideB, float * C, size_t strideC, int ith, int nth);
+                     const float * B, size_t strideB, float * C, size_t strideC, int ith, int nth,
+                     int panel_limit = -1);
 #else
 // Non-AMX builds still reference the hook, so keep a no-op around for the linker.
 extern "C" void iqk_amx_prewarm(int, const void *, size_t, int, int) {}
+#endif
+
+#ifdef GGML_AMX
+// Can the VNNI path handle this matmul at all? Mirrors the gates iqk_mul_mat
+// applies (dequant upgrade, then MulMat::prepare). The mixed-engine split must
+// only engage when both engines will accept their half; if VNNI declines a slice
+// it returns false while AMX returns true, and that mixed verdict inside one
+// ggml node deadlocks.
+static bool iqk_vnni_can_handle(int typeA, int typeB, long ne00, long Ny) {
+    if (typeA != GGML_TYPE_F32 && typeA != GGML_TYPE_F16 && typeA != GGML_TYPE_BF16 &&
+        MulMat::is_dequant_better(ggml_type(typeA), Ny) != ggml_type(typeA)) {
+        return true;
+    }
+    MulMat mm;
+    return MulMat::prepare(ggml_type(typeA), ggml_type(typeB), ne00, mm, Ny);
+}
+
+static float iqk_amx_split_cols() {
+    static const float v = [] { const char * e = getenv("GGML_AMX_SPLIT"); return e ? (float) atof(e) : 0.0f; }();
+    return v;
+}
+
+static float iqk_amx_split_thr() {
+    static const float v = [] { const char * e = getenv("GGML_AMX_THREADS"); return e ? (float) atof(e) : 0.46f; }();
+    return v;
+}
+
+// Single source of truth for the mixed-engine column split. ggml.c asks this too,
+// so the AMX half and the thread group that runs ggml's own vec_dot always agree
+// on whether a node is split and where the boundary sits.
+extern "C" bool iqk_amx_split_plan(long Nx, long Ny, long ne00, int typeA, int typeB,
+                                   int nth, long * out_na, int * out_nth_a) {
+    // DEAD END, kept disabled on purpose. Splitting at the ggml level needs ggml's
+    // own vec_dot to compute the high columns, but with GGML_USE_IQK_MULMAT
+    // ggml_vec_dot_q8_0_q8_0 (and friends) are compiled out and abort:
+    //   ggml-quants.c: GGML_ABORT("fatal error")
+    // So for Q8_0 there is no second engine to hand columns to. iqk_mul_mat is the
+    // only candidate and it declines the slice (MulMat::prepare fails for Q8_0 at
+    // every shape tried), which is what produced the original hang and now an
+    // abort. Opt in only when experimenting against weights whose vec_dot_type is
+    // not IQK-stubbed.
+    if (!getenv("GGML_AMX_MMSPLIT")) return false;
+    const float sc = iqk_amx_split_cols();
+    if (!(sc > 0.0f && sc < 1.0f) || nth < 2) return false;
+    const long npanels_all = (Nx + 95) / 96;
+    long npa = (long) std::lround((double) npanels_all * sc);
+    // 8 panels = 768 columns = 3 x 256, so both halves stay a multiple of 256;
+    // below that alignment iqk_mul_mat declines the slice.
+    npa = (npa / 8) * 8;
+    if (npanels_all < 16 || npa < 8 || npa > npanels_all - 8) return false;
+    const long na = npa * 96;
+    const long nv = Nx - na;
+    if (na % 256 || nv % 256) return false;
+    if (!iqk_vnni_can_handle(typeA, typeB, ne00, Ny)) return false;
+    int nth_a = (int) std::lround((double) nth * iqk_amx_split_thr());
+    if (nth_a < 1) nth_a = 1;
+    if (nth_a > nth - 1) nth_a = nth - 1;
+    if (out_na) *out_na = na;
+    if (out_nth_a) *out_nth_a = nth_a;
+    return true;
+}
 #endif
 
 extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
@@ -820,6 +898,88 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
     // calls. Everything else keeps the vec_dot path.
     if (Ny >= 16 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
         typeB == GGML_TYPE_F32) {
+        // Mixed-engine column split: hand the low output columns to AMX and the
+        // high ones to AVX-512 VNNI, both over the same activation rows, so the
+        // two engines work one matmul at the same time. AMX is gated off below
+        // ny=16 and its tiles need 16 rows, so this is prefill-only.
+        //   GGML_AMX_SPLIT   = fraction of columns AMX takes (0 = off, default)
+        //   GGML_AMX_THREADS = fraction of threads AMX gets (default 0.42)
+        // AMX is ~1.46x faster per thread than VNNI at these shapes, so at a
+        // 50/50 column split AMX only needs ~42% of the threads; give VNNI the
+        // rest and both finish together.
+        static const float split_cols = [] {
+            const char * e = getenv("GGML_AMX_SPLIT");
+            return e ? (float) atof(e) : 0.0f;
+        }();
+        if (split_cols > 0.0f && split_cols < 1.0f && nth > 1) {
+            // ggml's mul_mat opens its own `#pragma omp parallel for`, and the
+            // AMX prewarm sets omp_set_max_active_levels(2) process-wide, which
+            // turns that inner pragma into a NESTED team. When only part of the
+            // thread team is here (the rest are in the AMX slice) that nested
+            // team can never form and the graph deadlocks (observed as a hang in
+            // libgomp under ggml_compute_forward_mul_mat). Every path below
+            // parallelises explicitly through ith/nth, so one active level is
+            // all we need; this serialises the inner pragma onto the caller.
+#if defined(_OPENMP)
+            omp_set_max_active_levels(1);
+#endif
+            long na = 0;
+            int nth_a = 0;
+            // One implementation of the split decision, shared with ggml.c through
+            // iqk_amx_split_plan so both layers agree on every node. A mismatch is
+            // exactly what deadlocked: the AMX half reported the node handled while
+            // the VNNI half fell through to ggml's generic path, and the two
+            // populations then met at different barriers.
+            if (iqk_amx_split_plan((long) Nx, (long) Ny, (long) ne00, typeA, typeB, nth, &na, &nth_a)) {
+            const long nv = (long) Nx - na;
+            if (getenv("GGML_AMX_DBG")) {
+                static std::mutex dbg_m;
+                static std::set<int> dbg_seen;
+                std::lock_guard<std::mutex> lk(dbg_m);
+                if (dbg_seen.insert(ith).second) {
+                    fprintf(stderr, "[SPL] ith=%d nth=%d nth_a=%d na=%ld nv=%ld distinct=%zu\n",
+                            ith, nth, nth_a, na, nv, dbg_seen.size());
+                    fflush(stderr);
+                }
+            }
+            // Debug probes: record which threads make it back out of each engine.
+            auto dbg_done = [](const char * tag, int idx, int val) {
+                if (!getenv("GGML_AMX_DBG")) return;
+                static std::mutex m2;
+                static std::set<std::string> seen;
+                std::lock_guard<std::mutex> l(m2);
+                if (seen.insert(std::string(tag) + ":" + std::to_string(idx)).second) {
+                    int c = 0;
+                    const std::string pfx = std::string(tag) + ":";
+                    for (const auto & k : seen) if (k.compare(0, pfx.size(), pfx) == 0) ++c;
+                    fprintf(stderr, "[%s] ith=%d val=%d count=%d\n", tag, idx, val, c);
+                    fflush(stderr);
+                }
+            };
+            if (ith < nth_a) {
+                const bool amx_ok = iqk_amx_mul_mat((int) Nx, (int) Ny, (int) ne00, typeA, A, (size_t) strideA,
+                                    (const float *) B, (size_t) strideB, C, (size_t) stride_C,
+                                    ith, nth_a, (int) (na / 96));
+                dbg_done("AMXRET", ith, (int) amx_ok);
+                if (amx_ok) {
+                    return true;
+                }
+                // AMX declined: finish our own column slice on VNNI.
+                const bool fb_ok = iqk_mul_mat((int) na, (int) Ny, (int) ne00,
+                                   typeA, A, (size_t) strideA,
+                                   typeB, (const char *) B, (size_t) strideB,
+                                   C, (size_t) stride_C, ith, nth_a);
+                dbg_done("AMXFB", ith, (int) fb_ok);
+                return fb_ok;
+            }
+            const bool v_ok = iqk_mul_mat((int) nv, (int) Ny, (int) ne00,
+                               typeA, (const char *) A + (size_t) na * (size_t) strideA, (size_t) strideA,
+                               typeB, (const char *) B, (size_t) strideB,
+                               C + na, (size_t) stride_C, ith - nth_a, nth - nth_a);
+            dbg_done("VNNIRET", ith, (int) v_ok);
+            return v_ok;
+            }
+        }
         if (iqk_amx_mul_mat((int)Nx, (int)Ny, (int)ne00, typeA, A, (size_t)strideA,
                             (const float *)B, (size_t)strideB, C, (size_t)stride_C, ith, nth)) {
             return true;

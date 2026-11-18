@@ -40,6 +40,12 @@ std::atomic<long long> g_panel_calls{0};
 std::atomic<long long> g_panel_ns{0};
 std::atomic<long long> g_gemm_calls{0};
 std::atomic<long long> g_total_ns{0};
+// The epilogue (int32 -> f32 with row and column scales) is a separate pass over
+// the whole output, so it needs its own number. Without it panel_s looks small
+// while the dequant pass goes unmeasured.
+std::atomic<long long> g_epi_ns{0};
+std::atomic<long long> g_epi_elems{0};
+std::atomic<long long> g_memset_ns{0};
 
 namespace {
 
@@ -172,6 +178,7 @@ void ggml_amx_int8_gemm_blocked(int ny, int K, const int8_t * A, size_t lda,
     if (kb_size <= 0 || kb_size % 64) kb_size = K;
     ggml_amx_int8_tile_begin();
     const int bands = (ny + 15) / 16;
+    long long epi_elems = 0;
     const float * rscale = row_scale;
     float * out = C;
 
@@ -180,7 +187,10 @@ void ggml_amx_int8_gemm_blocked(int ny, int K, const int8_t * A, size_t lda,
         // The accumulator only needs to hold one panel: 16 rows x 96 columns per
         // band. Striding it by npad made this memset 142 MB per panel, which is
         // 25 GB of cache-destroying traffic per matmul.
+        const auto t_ms0 = std::chrono::steady_clock::now();
         memset(accbuf, 0, (size_t)bands * 16 * PANEL_COLS * sizeof(int32_t));
+        g_memset_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t_ms0).count();
 
         for (int kb = 0; kb < K; kb += kb_size) {
             const int kcount = (K - kb < kb_size) ? (K - kb) : kb_size;
@@ -191,6 +201,7 @@ void ggml_amx_int8_gemm_blocked(int ny, int K, const int8_t * A, size_t lda,
             }
         }
 
+        const auto t_epi0 = std::chrono::steady_clock::now();
         for (int band = 0; band < bands; band++) {
             const int m0 = band * 16;
             const int mrows = (ny - m0 < 16) ? (ny - m0) : 16;
@@ -202,10 +213,14 @@ void ggml_amx_int8_gemm_blocked(int ny, int K, const int8_t * A, size_t lda,
                     const int col = p * PANEL_COLS + j;
                     if (col >= (int)ldc_f) break;
                     dst[col] = as * (rscale ? rscale[col] : 1.0f) * (float)acc[r * PANEL_COLS + j];
+                    ++epi_elems;
                 }
             }
         }
+        g_epi_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t_epi0).count();
     }
+    g_epi_elems += epi_elems;
     ggml_amx_int8_tile_end();
 #else
     (void)ny; (void)K; (void)A; (void)lda; (void)Wp; (void)npad; (void)accbuf;
@@ -219,7 +234,9 @@ __attribute__((constructor)) static void iqk_blk_stats_hook(void) {
     installed = true;
     if (!getenv("GGML_AMX_STATS")) return;
     atexit([] {
-        fprintf(stderr, "amx_blk_stats: panel_calls=%lld panel_s=%.1f\n",
-                g_panel_calls.load(), g_panel_ns.load() / 1e9);
+        fprintf(stderr, "amx_blk_stats: panel_calls=%lld panel_s=%.1f epi_s=%.1f epi_elems=%.1fM memset_s=%.1f\n",
+                g_panel_calls.load(), g_panel_ns.load() / 1e9,
+                g_epi_ns.load() / 1e9, g_epi_elems.load() / 1e6,
+                g_memset_ns.load() / 1e9);
     });
 }

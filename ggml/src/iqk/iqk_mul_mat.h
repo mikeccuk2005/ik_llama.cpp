@@ -25,6 +25,13 @@ IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
         int typeB, const void * B, long strideB,
         float * C, long stride_C, int ith, int nth);
 
+// Mixed-engine column split plan. Returns true when this matmul should be split
+// between AMX (columns [0, *out_na)) and the AVX-512 vec_dot path (the rest), and
+// reports how many threads AMX should get. Single source of truth: ggml.c and
+// iqk_mul_mat.cpp both call it, so the two halves can never disagree.
+IQK_API bool iqk_amx_split_plan(long Nx, long Ny, long ne00, int typeA, int typeB,
+        int nth, long * out_na, int * out_nth_a);
+
 IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
         int typeA, const void * A, long strideA,
         int typeB, const void * B, long strideB,

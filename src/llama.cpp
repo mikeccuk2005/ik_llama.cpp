@@ -938,6 +938,21 @@ static int llama_openpangu_chunked_graph_nodes(const llama_model & model, const 
 
 int llama_context::max_nodes(int n_tokens, int n_kv) const {
     int max_nodes = model.max_nodes(n_tokens);
+    if (llm_arch_is_hybrid(model.arch)) {
+        // delta-net hybrid attention (qwen3-next / qwen3.5 / qwen4-exp) builds
+        // per-sequence chunk and gated-output tensors, so the graph node budget
+        // has to grow with the sequence count. The plain n_tokens*40 estimate
+        // only covers one sequence: with np>=12 a batch exhausted
+        // buf_compute_meta inside ggml_new_tensor and segfaulted during graph
+        // build (both the AMX and the AVX-512 build). Scale by n_seq_max, capped
+        // so an absurd value cannot balloon the meta buffer.
+        const int n_seq = (int) std::min<uint32_t>(std::max<uint32_t>(1, cparams.n_seq_max), 64);
+        max_nodes += (int) ((size_t) n_seq * (size_t) model.hparams.n_layer * 200);
+        if (getenv("GGML_NODES_DEBUG")) {
+            fprintf(stderr, "[max_nodes] n_tokens=%d n_seq=%u n_layer=%u model=%d -> %d\n",
+                    n_tokens, cparams.n_seq_max, model.hparams.n_layer, (int) model.max_nodes(n_tokens), max_nodes);
+        }
+    }
     max_nodes += llama_openpangu_chunked_graph_nodes(model, cparams, n_tokens, n_kv);
     if (model.arch == LLM_ARCH_MINIMAX_M3 && !kv_self.kr_l.empty()) {
         // build_minimaxm3 scores each MINIMAXM3_MSA_SCORE_CHUNK query rows separately, 16 nodes per chunk and layer
@@ -5691,6 +5706,10 @@ static bool llm_load_tensors(
 }
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
+// Pre-built AMX int8 shadows are created at model load (below). The symbol is a
+// no-op in non AMX builds (iqk_mul_mat.cpp), so the call is safe unconditionally.
+extern "C" void iqk_amx_prewarm(int type, const void * A, size_t strideA, int nx, int k);
+
 static int llama_model_load(const std::string & fname, llama_model & model, llama_model_params & params) {
     try {
         llama_model_loader ml(fname, params.ncmoe, params.use_mmap, params.check_tensors,
@@ -5788,6 +5807,26 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         // ---- populate reload registry ONLY when hot-swap is requested ----
         if (std::getenv("LLAMA_HOTSWAP_ENABLED") != nullptr) {
             model.reload = std::make_unique<reload_info>(ml);
+        }
+
+        // ---- pre-build AMX int8 shadows outside any OpenMP region ----
+        // The AMX matmul path builds these lazily on first use, inside the graph
+        // compute region, where the build serialises on a cache mutex and costs
+        // minutes on a model this size; a decode-only bench cell and small CLI
+        // prefills then never finish (measured 2026-11-17). Building here pays
+        // once at load and can use all cores. iqk_amx_prewarm is a no-op in non
+        // AMX builds (iqk_mul_mat.cpp), so this is safe to call unconditionally.
+        {
+            int n_prewarmed = 0;
+            for (const auto & [name, t] : model.tensors_by_name) {
+                (void) name;
+                if (!t || !t->data) continue;
+                // the AMX gate in iqk_mul_mat_4d is 2D only (ne02==1 && ne03==1)
+                if (t->ne[2] != 1 || t->ne[3] != 1) continue;
+                iqk_amx_prewarm((int) t->type, t->data, t->nb[1], (int) t->ne[1], (int) t->ne[0]);
+                ++n_prewarmed;
+            }
+            LLAMA_LOG_INFO("%s: AMX prewarm touched %d tensors\n", __func__, n_prewarmed);
         }
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
