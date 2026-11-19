@@ -3885,6 +3885,20 @@ void server_context::create_checkpoint_at_interval(server_slot & slot) {
     }
 }
 
+// true when a saved context checkpoint at or before the divergence point can restore recurrent state
+static bool has_restorable_checkpoint(const server_slot & slot) {
+    if (slot.n_past <= 0) {
+        return false;
+    }
+    const llama_pos pos_next = slot.cache_tokens.pos_next(slot.n_past);
+    for (const auto & ck : slot.server_cached_prompt.checkpoints) {
+        if (ck.pos_max <= pos_next) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void server_context::apply_checkpoint(server_slot & slot) {
     llama_pos pos_next = slot.cache_tokens.pos_next(slot.n_past);
     const bool has_new_tokens = (slot.n_past < slot.prompt_tokens.size());
@@ -4313,7 +4327,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             slot.n_past = prefix.first;
                             slot.n_past_prompt = prefix.second;
                             if (!llama_model_supports_partial_kv_reuse(model) &&
-                                slot.n_past < (int32_t) slot.cache_tokens.size()) {
+                                slot.n_past < (int32_t) slot.cache_tokens.size() &&
+                                !has_restorable_checkpoint(slot)) {
                                 // the cache diverges from the new prompt mid-sequence; this
                                 // model can only extend or reset a cached sequence (per-position
                                 // side state past the divergence point is already lost)
