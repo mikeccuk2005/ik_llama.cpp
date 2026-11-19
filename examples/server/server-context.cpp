@@ -707,6 +707,9 @@ void server_slot::release() {
         task.reset();
     }
     spec_target_only = false;
+    // a released slot has no draft rows in flight; stale indexes would be read by the next decode
+    i_batch_dft.clear();
+    logits_cache.clear();
     llama_decode_reset();
 }
 
@@ -5112,7 +5115,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                     try {
                         row = llama_get_logits_ith(ctx, slot.i_batch_dft[k]);
                     } catch (const std::exception &) {
-                        // index not in this batch (another slot decoded in between)
+                    }
+                    if (row == nullptr) {
+                        // index not in this batch (another slot decoded in between); release builds return nullptr
                         ok = false;
                         break;
                     }
@@ -5142,9 +5147,14 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                     slot.state = SLOT_STATE_PROCESSING;
                     slot.command = SLOT_COMMAND_NONE;
                     if (ret == user_cancel) {
+                        const bool had_task = slot.task != nullptr;
                         llama_pos cur_pos = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
                         slot.n_past = slot.cache_tokens.size_up_to_pos(cur_pos + 1);
                         slot.cache_tokens.keep_first(slot.n_past);
+                        // the abort is batch-wide; answer the other slots so their clients retry now instead of hanging
+                        if (had_task) {
+                            send_error(slot, "decode aborted because another request in the batch was cancelled, retry", ERROR_TYPE_SERVER);
+                        }
                         slot.release();
                     }
                     else {

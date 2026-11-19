@@ -364,10 +364,15 @@ struct server_response_reader {
     // the process-global stop_internal_decode flag. Best-effort cross-thread
     // read (slots are not resized at runtime; same race class as the global).
     bool any_task_on_slot() const {
+        bool ours = false;
         for (const auto & slot : ctx_server.slots) {
-            if (slot.is_processing() && id_tasks.count(slot.id_task)) return true;
+            if (!slot.is_processing()) continue;
+            // the stop flag aborts the whole batch; never kill other clients' slots with it,
+            // the cancel task posted on disconnect releases our slot at the next iteration
+            if (!id_tasks.count(slot.id_task)) return false;
+            ours = true;
         }
-        return false;
+        return ours;
     }
 
     // return nullptr if should_stop() is true before receiving a result
