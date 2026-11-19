@@ -468,6 +468,13 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
     auto & hparams = model.hparams;
     auto & kv_self = lctx.kv_self;
 
+    // Snapshot to this slot's own per-step checkpoint, not the shared base; the buffers
+    // are per sequence and restore reads the same per-seq object.
+    const llama_ckpt_data spec_ckpt_data{ LLAMA_CHECKPOINT_SPEC, 0, 0 };
+    auto & ckpt_seq = save_per_step_states
+        ? kv_self.llama_get_ckpt(spec_ckpt_data, (llama_seq_id) state_seq_id_local)
+        : kv_self.ckpt;
+
     int64_t head_k_dim  = hparams.ssm_d_state;
     int64_t num_k_heads = hparams.ssm_n_group;
     int64_t num_v_heads = hparams.ssm_dt_rank;
@@ -543,12 +550,13 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
             auto split_ssm_conv1d = (ggml_split_tensor_t *)l.ssm_conv1d->extra;
             GGML_ASSERT(split_ssm_conv1d && split_ssm_conv1d->splits[id]);
             ggml_tensor * per_step_ckpt = nullptr;
-            if (save_per_step_states && il < (int)kv_self.ckpt.per_step_ssm.size()) {
-                per_step_ckpt = kv_self.ckpt.per_step_ssm[il][id];
+            if (save_per_step_states && il < (int)ckpt_seq.per_step_ssm.size() &&
+                    id < (int)ckpt_seq.per_step_ssm[il].size()) {
+                per_step_ckpt = ckpt_seq.per_step_ssm[il][id];
             }
-            auto per_step_conv = save_per_step_states && il < (int)kv_self.ckpt.per_step_conv.size() &&
-                                 id < (int)kv_self.ckpt.per_step_conv[il].size()
-                               ? kv_self.ckpt.per_step_conv[il][id] : nullptr;
+            auto per_step_conv = save_per_step_states && il < (int)ckpt_seq.per_step_conv.size() &&
+                                 id < (int)ckpt_seq.per_step_conv[il].size()
+                               ? ckpt_seq.per_step_conv[il][id] : nullptr;
 
             auto output = build_qkv(ctx0, split_s_l->splits[id], split_ssm_conv1d->splits[id], qkv_mixed, inp_s_seq_qnext, beta, gate,
                                head_k_dim, num_k_heads_id, head_v_dim, num_v_heads_id, hparams.ssm_d_conv,
@@ -608,12 +616,13 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
 
     // Get per-step checkpoint tensor if available
     ggml_tensor * per_step_ckpt = nullptr;
-    if (save_per_step_states && il < (int)kv_self.ckpt.per_step_ssm.size()) {
-        per_step_ckpt = kv_self.ckpt.per_step_ssm[il].front();
+    if (save_per_step_states && il < (int)ckpt_seq.per_step_ssm.size() &&
+            !ckpt_seq.per_step_ssm[il].empty()) {
+        per_step_ckpt = ckpt_seq.per_step_ssm[il].front();
     }
 
-    auto per_step_conv = save_per_step_states && il < (int)kv_self.ckpt.per_step_conv.size() && !kv_self.ckpt.per_step_conv[il].empty()
-                       ? kv_self.ckpt.per_step_conv[il].front() : nullptr;
+    auto per_step_conv = save_per_step_states && il < (int)ckpt_seq.per_step_conv.size() && !ckpt_seq.per_step_conv[il].empty()
+                       ? ckpt_seq.per_step_conv[il].front() : nullptr;
 
     auto output = build_qkv(ctx0, kv_self.s_l[il], model.layers[il].ssm_conv1d,
         qkv_mixed, inp_s_seq_qnext, beta, gate,

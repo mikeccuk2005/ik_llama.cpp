@@ -112,6 +112,14 @@ ggml_tensor * delta_net::build_layer_attn_kda_core(ggml_context * ctx0, ggml_cgr
     auto & kv_self = lctx.kv_self;
     auto & layer   = model.layers[il];
 
+    // The per-step snapshot must go to this slot's own checkpoint, not the shared base:
+    // the buffers are allocated per sequence and restore reads from the same per-seq
+    // object, so writing anywhere else leaves the other slots restoring unwritten state.
+    const llama_ckpt_data spec_ckpt_data{ LLAMA_CHECKPOINT_SPEC, 0, 0 };
+    auto & ckpt_seq = save_per_step_states
+        ? kv_self.llama_get_ckpt(spec_ckpt_data, (llama_seq_id) state_seq_id_local)
+        : kv_self.ckpt;
+
     if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH && kv_self.s_l[il]->extra) {
         auto split_s_l = (ggml_split_tensor_t *) kv_self.s_l[il]->extra;
         GGML_ASSERT(split_s_l && split_s_l->n_device > 1);
@@ -147,12 +155,13 @@ ggml_tensor * delta_net::build_layer_attn_kda_core(ggml_context * ctx0, ggml_cgr
                     split(layer.ssm_conv1d_q), split(layer.ssm_conv1d_k), split(layer.ssm_conv1d_v));
 
             ggml_tensor * per_step_ckpt = nullptr;
-            if (save_per_step_states && il < (int) kv_self.ckpt.per_step_ssm.size()) {
-                per_step_ckpt = kv_self.ckpt.per_step_ssm[il][id];
+            if (save_per_step_states && il < (int) ckpt_seq.per_step_ssm.size() &&
+                    id < (int) ckpt_seq.per_step_ssm[il].size()) {
+                per_step_ckpt = ckpt_seq.per_step_ssm[il][id];
             }
-            auto per_step_conv = save_per_step_states && il < (int) kv_self.ckpt.per_step_conv.size() &&
-                                 id < (int) kv_self.ckpt.per_step_conv[il].size()
-                               ? kv_self.ckpt.per_step_conv[il][id] : nullptr;
+            auto per_step_conv = save_per_step_states && il < (int) ckpt_seq.per_step_conv.size() &&
+                                 id < (int) ckpt_seq.per_step_conv[il].size()
+                               ? ckpt_seq.per_step_conv[il][id] : nullptr;
 
             ggml_tensor * rda_delta = nullptr;
             if (layer.ssm_rda) {
@@ -225,12 +234,13 @@ ggml_tensor * delta_net::build_layer_attn_kda_core(ggml_context * ctx0, ggml_cgr
     auto conv = build_kda_conv(ctx0, layer.ssm_conv1d_q, layer.ssm_conv1d_k, layer.ssm_conv1d_v);
 
     ggml_tensor * per_step_ckpt = nullptr;
-    if (save_per_step_states && il < (int) kv_self.ckpt.per_step_ssm.size()) {
-        per_step_ckpt = kv_self.ckpt.per_step_ssm[il].front();
+    if (save_per_step_states && il < (int) ckpt_seq.per_step_ssm.size() &&
+            !ckpt_seq.per_step_ssm[il].empty()) {
+        per_step_ckpt = ckpt_seq.per_step_ssm[il].front();
     }
-    auto per_step_conv = save_per_step_states && il < (int) kv_self.ckpt.per_step_conv.size() &&
-                         !kv_self.ckpt.per_step_conv[il].empty()
-                       ? kv_self.ckpt.per_step_conv[il].front() : nullptr;
+    auto per_step_conv = save_per_step_states && il < (int) ckpt_seq.per_step_conv.size() &&
+                         !ckpt_seq.per_step_conv[il].empty()
+                       ? ckpt_seq.per_step_conv[il].front() : nullptr;
 
     auto output = build_qkv(ctx0, kv_self.s_l[il], conv, qkv_mixed,
             inp_s_seq_qnext, beta, log_decay,
