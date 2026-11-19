@@ -2416,6 +2416,11 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, u
             return false;
         }
     }
+    // The graph builders gate the capture on the BASE checkpoint's per_step_max_allocated
+    // (delta_net reads kv_self.ckpt.per_step_max_allocated, not a pool entry), so mirror
+    // the allocated step count onto the base or save_per_step_states is never set and the
+    // snapshot is never captured.
+    ckpt.per_step_max_allocated = max_tokens;
     return true;
 }
 
