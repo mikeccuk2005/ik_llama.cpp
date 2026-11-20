@@ -9590,6 +9590,111 @@ static size_t llama_get_available_ram_bytes() {
 static size_t llama_get_available_ram_bytes() { return 0; }
 #endif
 
+// MIRROR_NONEXP: mirror every weight tensor EXCEPT MoE expert tensors ("*exps*"). Experts keep a
+// single shared copy, bound per layer to one node, so a whole layer's expert compute stays on the
+// same domain and only the cross-layer alternation crosses the inter-socket link. Saves
+// (n_nodes-1) x expert-bytes of RAM against the full weight mirror.
+static void llama_mirror_weights_nonexp(const llama_model & model) {
+    const int n_nodes = ggml_numa_node_count();
+    if (n_nodes < 2) {
+        return;
+    }
+
+    // pass 1: layer of each expert tensor, and the dense (mirrored) tensors with their arena offsets
+    struct dense_item {
+        struct ggml_tensor * t;
+        size_t off;
+    };
+    std::vector<dense_item> dense;
+    std::vector<struct ggml_tensor *> exps;
+    size_t arena_size = 0;
+    for (struct ggml_context * ctx : model.ctxs) {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (strstr(t->name, "exps")) {
+                exps.push_back(t);
+                continue;
+            }
+            dense.push_back({ t, arena_size });
+            arena_size += GGML_PAD(ggml_nbytes(t), 64);
+        }
+    }
+    if (arena_size == 0) {
+        return;
+    }
+
+    const size_t extra = arena_size * (size_t) (n_nodes - 1);
+    const size_t avail = llama_get_available_ram_bytes();
+    LLAMA_LOG_INFO("%s: NUMA mirror-nonexp: %d nodes, %zu dense tensors (%.2f GiB), %zu expert tensors shared; "
+            "need +%.2f GiB for dense mirrors (%.2f GiB available)\n", __func__, (int) dense.size(),
+            arena_size/1073741824.0, exps.size(), extra/1073741824.0, avail/1073741824.0);
+    if (avail > 0 && extra + (2ull << 30) > avail) {
+        LLAMA_LOG_WARN("%s: NUMA mirror-nonexp: insufficient free RAM to duplicate dense weights; "
+                "continuing WITHOUT weight mirroring\n", __func__);
+        return;
+    }
+
+    // one compacted arena per extra node holding only the dense tensors
+    llama_model::numa_mirror_buffer mb;
+    mb.buf  = nullptr;
+    mb.size = arena_size;
+    for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+        mb.node_base[n] = NULL;
+    }
+    for (int n = 1; n < n_nodes; ++n) {
+        void * p = ggml_numa_alloc(arena_size, n);
+        if (!p) {
+            for (int k = 1; k < n; ++k) {
+                ggml_numa_free(mb.node_base[k], arena_size);
+            }
+            LLAMA_LOG_WARN("%s: NUMA mirror-nonexp: arena allocation failed; continuing WITHOUT mirroring\n", __func__);
+            return;
+        }
+        mb.node_base[n] = p;
+        for (auto & it : dense) {
+            memcpy((char *) p + it.off, it.t->data, ggml_nbytes(it.t));
+        }
+    }
+    model.numa_mirror_bufs.push_back(mb);
+
+    void * node_data[GGML_NUMA_MAX_NODES];
+    for (auto & it : dense) {
+        node_data[0] = it.t->data;
+        for (int n = 1; n < n_nodes; ++n) {
+            node_data[n] = (char *) mb.node_base[n] + it.off;
+        }
+        ggml_numa_tensor_set_mirror(it.t, node_data);
+    }
+
+    // experts: single copy, whole layer bound to one node
+    int     cur_layer = -1;
+    int     cur_node  = 0;
+    size_t  per_node[GGML_NUMA_MAX_NODES] = { 0 };
+    for (auto * t : exps) {
+        int layer = cur_layer;
+        const char * blk = strstr(t->name, "blk.");
+        if (blk) {
+            int l = -1;
+            if (sscanf(blk + 4, "%d.", &l) == 1) {
+                layer = l;
+            }
+        }
+        if (layer != cur_layer) {
+            cur_layer = layer;
+            cur_node  = ggml_numa_nonexp_node_for_layer(layer < 0 ? 0 : layer);
+        }
+        const size_t nb = ggml_nbytes(t);
+        ggml_numa_bind(t->data, nb, cur_node);
+        per_node[cur_node] += nb;
+    }
+    LLAMA_LOG_INFO("%s: NUMA mirror-nonexp: %d dense tensors mirrored, %zu expert tensors kept single-copy "
+            "(node0 %.2f GiB, node1 %.2f GiB), placement=%s\n", __func__, (int) dense.size(), exps.size(),
+            per_node[0]/1073741824.0, per_node[n_nodes > 1 ? 1 : 0]/1073741824.0,
+            ggml_numa_get_nonexp_node() < 0 ? "alternate by layer" : "fixed node");
+}
+
 // Duplicate the model's host weight buffers once per NUMA node and point each weight tensor at its
 // per-node copies (see ggml_numa_tensor_data). Must run AFTER all weight repacking (load-time and
 // the context-time up/gate merge) so the mirrored bytes are final. Idempotent per model.
@@ -9599,6 +9704,10 @@ static void llama_mirror_model_weights(const llama_model & model) {
     }
     if (!model.numa_mirror_bufs.empty()) {
         return; // already mirrored (e.g. a second context created on the same model)
+    }
+    if (ggml_numa_nonexp_active()) {
+        llama_mirror_weights_nonexp(model);
+        return;
     }
     const int n_nodes = ggml_numa_node_count();
     if (n_nodes < 2) {

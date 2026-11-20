@@ -2615,6 +2615,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
         else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
         else if (value == "mirror") { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
+        else if (value == "mirror-nonexp") { params.numa = GGML_NUMA_STRATEGY_MIRROR_NONEXP; }
         else { invalid_param = true; }
         return true;
     }
@@ -2635,6 +2636,12 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         if (!ok) { invalid_param = true; return true; }
         params.numa_mirror = mask;
+        return true;
+    }
+    if (arg == "--numa-nonexp-node") {
+        CHECK_ARG
+        params.numa = GGML_NUMA_STRATEGY_MIRROR_NONEXP; // implies mirror-nonexp
+        params.numa_nonexp_node = std::atoi(argv[i]);    // -1 = alternate layers across nodes
         return true;
     }
     if (arg == "-dev" || arg == "--device") {
@@ -3712,10 +3719,14 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "  - numactl: use the CPU map provided by numactl\n"
                                                                         "  - mirror: duplicate model weights/KV per NUMA node so each node reads only local memory.\n"
                                                                         "            pins threads per node and uses N x RAM (N = number of NUMA nodes). implies --no-mmap.\n"
+                                                                        "  - mirror-nonexp: like mirror, but MoE expert tensors (*exps*) keep one shared copy with a\n"
+                                                                        "            whole layer placed on a single node, saving most of the duplicated RAM.\n"
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
     options.push_back({ "*",           "       --numa-mirror LIST",     "comma list selecting what to mirror with --numa mirror:\n"
                                                                         "  weights, kv, all, none (default: all). implies --numa mirror" });
+    options.push_back({ "*",           "       --numa-nonexp-node N",   "with --numa mirror-nonexp: NUMA node holding the single shared copy of\n"
+                                                                        "expert tensors (default -1: alternate layers across nodes)" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",
@@ -4508,8 +4519,11 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
     // apply any --numa-mirror component customization before the model / context are built
     // (ggml_numa_init already defaulted this to "all" when --numa mirror was selected).
-    if (params.numa == GGML_NUMA_STRATEGY_MIRROR) {
+    if (params.numa == GGML_NUMA_STRATEGY_MIRROR || params.numa == GGML_NUMA_STRATEGY_MIRROR_NONEXP) {
         ggml_numa_set_mirror(params.numa_mirror);
+        if (params.numa == GGML_NUMA_STRATEGY_MIRROR_NONEXP) {
+            ggml_numa_set_nonexp_node(params.numa_nonexp_node);
+        }
     }
 
     auto mparams = common_model_params_to_llama(params);

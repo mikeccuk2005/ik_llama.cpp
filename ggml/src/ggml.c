@@ -4993,6 +4993,7 @@ struct ggml_numa_node {
 struct ggml_numa_nodes {
     enum ggml_numa_strategy numa_strategy;
     uint32_t mirror_flags; // ggml_numa_mirror_flags: what to duplicate per node when strategy == MIRROR
+    int      nonexp_node;  // MIRROR_NONEXP only: node for expert tensors, -1 = alternate by layer
     struct ggml_numa_node nodes[GGML_NUMA_MAX_NODES];
     uint32_t n_nodes;
     uint32_t total_cpus; // hardware threads on system
@@ -5204,8 +5205,13 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     g_state.numa.numa_strategy = numa_flag;
 
     // default to mirroring everything; the caller may narrow this via ggml_numa_set_mirror()
-    if (numa_flag == GGML_NUMA_STRATEGY_MIRROR && g_state.numa.mirror_flags == 0) {
+    if ((numa_flag == GGML_NUMA_STRATEGY_MIRROR || numa_flag == GGML_NUMA_STRATEGY_MIRROR_NONEXP) &&
+            g_state.numa.mirror_flags == 0) {
         g_state.numa.mirror_flags = GGML_NUMA_MIRROR_ALL;
+    }
+    // MIRROR_NONEXP: alternate expert layers across nodes unless the caller picks one
+    if (numa_flag == GGML_NUMA_STRATEGY_MIRROR_NONEXP) {
+        g_state.numa.nonexp_node = -1;
     }
 
     GGML_PRINT_DEBUG("numa strategy %u\n",g_state.numa.numa_strategy);
@@ -5316,7 +5322,33 @@ int ggml_numa_node_count(void) {
 }
 
 bool ggml_numa_mirror_active(void) {
-    return g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR && g_state.numa.n_nodes > 1;
+    return (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR ||
+            g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR_NONEXP) && g_state.numa.n_nodes > 1;
+}
+
+bool ggml_numa_nonexp_active(void) {
+    return g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR_NONEXP && g_state.numa.n_nodes > 1;
+}
+
+void ggml_numa_set_nonexp_node(int node) {
+    g_state.numa.nonexp_node = node;
+}
+
+int ggml_numa_get_nonexp_node(void) {
+    return g_state.numa.nonexp_node;
+}
+
+// MIRROR_NONEXP: which node holds the single copy of one layer's expert tensors. Negative
+// layer alternates nodes so the UPI traffic is split evenly between the two domains.
+int ggml_numa_nonexp_node_for_layer(int layer) {
+    const int n = (int) g_state.numa.n_nodes;
+    if (n <= 1) {
+        return 0;
+    }
+    if (g_state.numa.nonexp_node >= 0) {
+        return g_state.numa.nonexp_node < n ? g_state.numa.nonexp_node : 0;
+    }
+    return ((layer % n) + n) % n;
 }
 
 void ggml_numa_set_mirror(uint32_t flags) {
@@ -5424,7 +5456,7 @@ void ggml_numa_bind(void * ptr, size_t size, int node) {
 // Activates only when NUMA mirroring is on (threads are pinned per node, matching the block split
 // used by ggml_numa_node_for_thread); otherwise leaves the flat barrier in place.
 static void ggml_numa_barrier_setup(int n_threads) {
-    if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_MIRROR || g_state.numa.n_nodes < 2 || n_threads <= 1) {
+    if (!ggml_numa_mirror_active() || g_state.numa.n_nodes < 2 || n_threads <= 1) {
         g_numa_barrier.active = 0;
         return;
     }
@@ -30016,6 +30048,7 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
             node_num = g_state.numa.current_node;
             break;
         case GGML_NUMA_STRATEGY_MIRROR:
+        case GGML_NUMA_STRATEGY_MIRROR_NONEXP:
             // block-split threads across nodes; must match ggml_numa_node_for_thread()
             // used to pick the node-local weight copy during compute.
             node_num = ggml_numa_node_for_thread(thread_n, n_threads);

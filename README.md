@@ -47,6 +47,24 @@ has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`
 - **Requirements:** Linux, more than one NUMA node, and enough RAM to hold the model N times.
   For best results, disable kernel auto-balancing:
   `echo 0 | sudo tee /proc/sys/kernel/numa_balancing`.
+
+**`--numa mirror-nonexp`** is a memory-lean variant for MoE models. Dense tensors (attention,
+norms, embeddings) are still duplicated per node, but every `*exps*` tensor keeps a **single
+shared copy**, with all expert tensors of one layer bound to the same node so a whole layer's
+expert matmuls stay on one NUMA domain. Layers alternate between nodes by default, which splits
+the cross-socket traffic evenly; `--numa-nonexp-node N` pins every layer to one node instead.
+
+```bash
+# experts shared, dense weights mirrored, layers alternate node0/node1
+./build/bin/llama-server -m model.gguf --numa mirror-nonexp -t <total cores>
+# every expert layer on node 1
+./build/bin/llama-server -m model.gguf --numa mirror-nonexp --numa-nonexp-node 1
+```
+
+On a hybrid MoE where expert tensors are the bulk of the weights this cuts the extra RAM from
+`(N-1) x model` to roughly `(N-1) x dense-only`, at the cost of the expert reads that land on
+the other socket crossing the inter-socket link. KV mirroring is unchanged (`--numa-mirror kv`
+to turn it off).
 - **Thread count:** token generation is memory-bandwidth bound and may peak *below* the full
   physical-core count; it can be worth sweeping `-t` to find the sweet spot for your machine.
 

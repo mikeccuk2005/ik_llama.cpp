@@ -718,6 +718,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 else if (value == "isolate")                    { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
                 else if (value == "numactl")                    { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
                 else if (value == "mirror")                     { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
+                else if (value == "mirror-nonexp")              { params.numa = GGML_NUMA_STRATEGY_MIRROR_NONEXP; }
                 else { invalid_param = true; break; }
             }
         } else if (arg == "-fa" || arg == "--flash-attn") {

@@ -950,6 +950,7 @@ extern "C" {
         GGML_NUMA_STRATEGY_ISOLATE    = 2,
         GGML_NUMA_STRATEGY_NUMACTL    = 3,
         GGML_NUMA_STRATEGY_MIRROR     = 4,
+        GGML_NUMA_STRATEGY_MIRROR_NONEXP = 5, // mirror weights except MoE "*exps*" tensors
         GGML_NUMA_STRATEGY_COUNT
     };
 
@@ -988,9 +989,15 @@ extern "C" {
 
     // NUMA mirroring (GGML_NUMA_STRATEGY_MIRROR): duplicate read-mostly data per NUMA node
     GGML_API int      ggml_numa_node_count(void);                  // number of NUMA nodes detected (>=1)
-    GGML_API bool     ggml_numa_mirror_active(void);               // true if strategy == MIRROR and >1 node
+    GGML_API bool     ggml_numa_mirror_active(void);               // true if strategy is MIRROR or MIRROR_NONEXP and >1 node
     GGML_API void     ggml_numa_set_mirror(uint32_t flags);        // which ggml_numa_mirror_flags to mirror
     GGML_API uint32_t ggml_numa_get_mirror(void);                  // current mirror flags
+    // MIRROR_NONEXP: single shared copy for expert tensors, placed per layer. node < 0 = alternate
+    // layers across nodes (layer % n_nodes); node >= 0 = pin every layer to that node.
+    GGML_API bool     ggml_numa_nonexp_active(void);               // true if strategy == MIRROR_NONEXP and >1 node
+    GGML_API void     ggml_numa_set_nonexp_node(int node);         // -1 = alternate by layer index
+    GGML_API int      ggml_numa_get_nonexp_node(void);             // requested node, -1 when alternating
+    GGML_API int      ggml_numa_nonexp_node_for_layer(int layer);  // resolve the node for one layer
     GGML_API int      ggml_numa_node_for_thread(int ith, int nth); // block split of threads across nodes
     // allocate/free memory bound to a specific NUMA node (mmap + mbind + THP)
     GGML_API void *   ggml_numa_alloc(size_t size, int node);
