@@ -26,12 +26,20 @@ static bool server_speculative_multimodal_supported(const common_params_speculat
         return true;
     }
     for (const auto & stage : stages) {
+        // self-spec stages (ngram-mod, ...) only read text tokens; a slot whose prompt
+        // holds media skips them per request (see server_slot_spec_text_ok)
         if (stage.type != COMMON_SPECULATIVE_TYPE_MTP &&
-                !common_speculative_type_is_dflash_family(stage.type)) {
+                !common_speculative_type_is_dflash_family(stage.type) &&
+                !common_speculative_type_is_self_spec(stage.type)) {
             return false;
         }
     }
     return true;
+}
+
+// true when the slot's token history is plain text, so text-reading spec stages may use it
+static bool server_slot_spec_text_ok(server_slot & slot) {
+    return !slot.cache_tokens.has_mtmd || !slot.cache_tokens.has_mtmd_data();
 }
 
 // ---- context-checkpoint disk spill (NVMe offload for checkpoint RAM) ----
@@ -3777,7 +3785,9 @@ void server_context::add_sampled_tokens() {
         const bool has_seat = mtp_seat_acquire(slot);
         const bool mtp_only = slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain();
         common_speculative_set_skip_mtp(slot.spec, !has_seat);
-        const int n_draft_max_pre = (has_seat || !mtp_only) ? slot.get_n_draft_max() : 0;
+        const bool text_ok = server_slot_spec_text_ok(slot) || mtp_only ||
+            slot.params.speculative.has_dflash_family_stage();
+        const int n_draft_max_pre = ((has_seat || !mtp_only) && text_ok) ? slot.get_n_draft_max() : 0;
         if (n_draft_max_pre > 0) {
             if (mctx && !server_speculative_multimodal_supported(slot.params.speculative)) {
                 GGML_ABORT("not supported by multimodal");
@@ -3789,7 +3799,9 @@ void server_context::add_sampled_tokens() {
                 ? empty_prompt
                 : slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain()
                     ? empty_prompt
-                    : slot.cache_tokens.get_text_tokens();
+                    : !server_slot_spec_text_ok(slot)
+                        ? empty_prompt
+                        : slot.cache_tokens.tokens_ref();
 
             auto & params_spec = slot.params.speculative;
             const llama_pos draft_base_pos = slot.uses_mtp() ? slot.cache_tokens.pos_next() : -1;
@@ -5292,7 +5304,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                     ? empty_prompt
                     : slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain()
                         ? empty_prompt
-                        : slot.cache_tokens.get_text_tokens();
+                        : !server_slot_spec_text_ok(slot)
+                            ? empty_prompt
+                            : slot.cache_tokens.tokens_ref();
                 common_speculative_begin(slot.spec, spec_prompt);
             }
 

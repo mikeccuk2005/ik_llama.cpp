@@ -438,6 +438,9 @@ public:
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const std::vector<llama_token>& get_text_tokens() const;
 
+    // raw token list; media positions hold LLAMA_TOKEN_NULL, so check has_mtmd_data() first
+    const std::vector<llama_token>& tokens_ref() const { return tokens; }
+
     // for compatibility with speculative decoding
     void set_token(llama_pos pos, llama_token id);
 
