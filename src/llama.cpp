@@ -9628,7 +9628,7 @@ static void llama_mirror_weights_nonexp(const llama_model & model) {
     const size_t extra = arena_size * (size_t) (n_nodes - 1);
     const size_t avail = llama_get_available_ram_bytes();
     LLAMA_LOG_INFO("%s: NUMA mirror-nonexp: %d nodes, %zu dense tensors (%.2f GiB), %zu expert tensors shared; "
-            "need +%.2f GiB for dense mirrors (%.2f GiB available)\n", __func__, (int) dense.size(),
+            "need +%.2f GiB for dense mirrors (%.2f GiB available)\n", __func__, n_nodes, dense.size(),
             arena_size/1073741824.0, exps.size(), extra/1073741824.0, avail/1073741824.0);
     if (avail > 0 && extra + (2ull << 30) > avail) {
         LLAMA_LOG_WARN("%s: NUMA mirror-nonexp: insufficient free RAM to duplicate dense weights; "
