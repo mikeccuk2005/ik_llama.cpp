@@ -177,6 +177,20 @@ Examples:
 
 Autotunes the active stage parameters and reports the best configuration back as a canonical `--spec-type ...` snippet.
 
+### `--max-mtp-concurrent N`
+
+Caps how many slots draft with MTP at the same time (default `0`, no cap). Needs `--spec-parallel` when `-np > 1`.
+
+A slot takes a seat when it starts decoding and keeps it until its request finishes. When every seat is taken, the next slot decodes normally, one token per step. It still feeds each accepted token into its MTP state, so once a seat frees it switches to MTP mid-generation without re-warming. The log line `took MTP seat (1/1 in use) after 197 decoded tokens` marks that switch.
+
+This exists because MTP costs memory bandwidth on every slot that uses it. On a CPU box with 4 busy slots that cost was higher than the speedup, so `-np 4` with MTP on every slot was slower than no speculation. With `--max-mtp-concurrent 1`, a lone request still gets the full MTP speedup and extra requests run at plain decode speed.
+
+```bash
+./llama-server [...] -np 4 --spec-parallel --spec-type mtp:n_max=1,p_min=0.5 --max-mtp-concurrent 1
+```
+
+Env: `LLAMA_ARG_MAX_MTP_CONCURRENT`.
+
 ## Statistics
 Each speculative decoding implementation prints statistics.
 

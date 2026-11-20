@@ -169,6 +169,8 @@ struct server_slot {
     std::vector<common_sampler::elb_state> prev_elb_states;
 
     bool spec_prompt_warmup_failed = false;
+    // holds one of the --max-mtp-concurrent seats; kept until the slot is released
+    bool mtp_seat = false;
     // speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
@@ -377,6 +379,9 @@ struct server_context {
     void context_shift();
 
     void add_sampled_tokens();
+
+    // true when the slot may draft with MTP this step (claims a free seat if needed)
+    bool mtp_seat_acquire(server_slot & slot);
 
     void batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch,  int32_t & batch_type);
 

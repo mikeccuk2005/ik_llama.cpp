@@ -1020,6 +1020,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_FLASH_ATTN",       params.flash_attn);
     get_env("LLAMA_ARG_LOGLEVEL",       params.loglevel);
     get_env("LLAMA_ARG_SPEC_PARALLEL",  params.spec_parallel);
+    get_env("LLAMA_ARG_MAX_MTP_CONCURRENT", params.max_mtp_concurrent);
     get_env("LLAMA_ARG_DEFRAG_THOLD",     params.defrag_thold);
     get_env("LLAMA_ARG_CONT_BATCHING",    params.cont_batching);
     get_env("LLAMA_ARG_HOST",             params.hostname);
@@ -1860,6 +1861,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--spec-parallel") {
         params.spec_parallel = true;
+        return true;
+    }
+    if (arg == "--max-mtp-concurrent") {
+        CHECK_ARG
+        params.max_mtp_concurrent = std::max(0, std::stoi(argv[i]));
         return true;
     }
     if (arg == "--spec-type") {
@@ -3390,6 +3396,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --minilog",              "print important information" });
     options.push_back({ "*",           "       --loglevel LVL",         "log level: off|error|warn|info|debug (default: info)" });
     options.push_back({ "*",           "       --spec-parallel",        "allow speculative stages (incl. MTP) with -np > 1 (default: off)" });
+    options.push_back({ "*",           "       --max-mtp-concurrent N", "max slots running MTP at once; others decode normally until a seat frees (default: 0 = no cap)" });
     options.push_back({ "*",           "       --verbosity N",          "set specific verbosity level (default: %d)", params.verbosity });
     options.push_back({ "*",           "       --verbose-prompt",       "print a verbose prompt before generation (default: %s)", params.verbose_prompt ? "true" : "false" });
     options.push_back({ "*",           "-dr,   --dry-run",       "skip loading tensors in the files"});

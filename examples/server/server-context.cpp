@@ -571,6 +571,7 @@ void server_slot::reset() {
     spec_target_only = false;
     i_batch_dft.clear();
     spec_prompt_warmup_failed = false;
+    mtp_seat = false;
     n_sent_token_probs = 0;
     infill = false;
     ga_i = 0;
@@ -707,6 +708,7 @@ void server_slot::release() {
         task.reset();
     }
     spec_target_only = false;
+    mtp_seat = false;
     // a released slot has no draft rows in flight; stale indexes would be read by the next decode
     i_batch_dft.clear();
     logits_cache.clear();
@@ -3738,6 +3740,27 @@ void server_context::context_shift() {
     }
 }
 
+// true when the slot may draft with MTP this step (claims a free seat if needed)
+bool server_context::mtp_seat_acquire(server_slot & slot) {
+    const int cap = params_base.max_mtp_concurrent;
+    if (cap <= 0 || !slot.uses_mtp()) {
+        return true;
+    }
+    if (slot.mtp_seat) {
+        return true;
+    }
+    int n_held = 0;
+    for (const auto & other : slots) {
+        n_held += (other.mtp_seat && other.state == SLOT_STATE_PROCESSING) ? 1 : 0;
+    }
+    if (n_held >= cap) {
+        return false;
+    }
+    slot.mtp_seat = true;
+    SLT_INF(slot, "took MTP seat (%d/%d in use) after %d decoded tokens\n", n_held + 1, cap, slot.n_decoded);
+    return true;
+}
+
 void server_context::add_sampled_tokens() {
     for (auto& slot : slots) {
         slot.released = false;
@@ -3749,7 +3772,8 @@ void server_context::add_sampled_tokens() {
         // generate draft tokens in speculative decoding mode
         // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
         //       perform the speculative drafting for all sequences at the same time in a single batch
-        const int n_draft_max_pre = slot.get_n_draft_max();
+        // --max-mtp-concurrent: a slot without a seat decodes root-only this step
+        const int n_draft_max_pre = mtp_seat_acquire(slot) ? slot.get_n_draft_max() : 0;
         if (n_draft_max_pre > 0) {
             if (mctx && !server_speculative_multimodal_supported(slot.params.speculative)) {
                 GGML_ABORT("not supported by multimodal");
@@ -5312,6 +5336,18 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 slot.release();
                 slot.i_batch = -1;
                 continue;
+            }
+
+            if (slot.uses_mtp() && !slot.mtp_seat && params_base.max_mtp_concurrent > 0 &&
+                slot.n_decoded > 0 && !slot.spec_prompt_warmup_failed) {
+                // seatless decode: keep the MTP hidden/KV state in step with the target
+                const int out_idx = batch_out_index(slot.i_batch);
+                const llama_pos pos = slot.cache_tokens.pos_next() - 1;
+                if (!common_speculative_commit_accepted_output(
+                        slot.spec, ctx, COMMON_SPECULATIVE_TYPE_MTP, slot.id, pos,
+                        slot.sampled, { id }, { out_idx })) {
+                    common_speculative_clear_sequence_hidden(slot.spec, slot.id);
+                }
             }
 
             slot.n_decoded += 1;

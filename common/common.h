@@ -504,6 +504,9 @@ struct gpt_params {
     // state is already per-slot; this opts out of the conservative single-slot
     // guard. Off by default: verify accept rates and outputs before relying on it.
     bool spec_parallel     = false;
+    // Cap on slots that run MTP at the same time (0 = no cap). A slot outside the cap
+    // decodes normally, keeps its MTP hidden/KV state warm, and takes a seat once one frees.
+    int  max_mtp_concurrent = 0;
 
     std::string cache_type_k = "f16"; // KV cache data type for the K
     std::string cache_type_v = "f16"; // KV cache data type for the V
