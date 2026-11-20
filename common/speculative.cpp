@@ -1105,6 +1105,7 @@ struct common_speculative {
     bool last_step_target_only = false;
     float draft_temperature = 0.0f;
     uint32_t draft_seed = LLAMA_DEFAULT_SEED;
+    bool skip_mtp = false; // --max-mtp-concurrent: slot has no MTP seat, draft with other stages only
 };
 
 static bool common_speculative_stage_chain_matches(
@@ -1637,6 +1638,10 @@ llama_tokens common_speculative_draft(
         }
         result.clear();
 
+        if (spec->skip_mtp && impl->type == COMMON_SPECULATIVE_TYPE_MTP) {
+            continue;
+        }
+
         if (spec->tuner && spec->tuner->has_dflash_target_only_arm() &&
                 impl->type == COMMON_SPECULATIVE_TYPE_DFLASH && impl_params.n_max == 0) {
             spec->curr_impl = impl.get();
@@ -1950,6 +1955,13 @@ bool common_speculative_ensure_sequence_hidden(
     return common_speculative_capture_output_hidden(spec, ctx, -1, seq_id, pos);
 }
 
+// skip the MTP stage on the next drafts (other stages in the chain still run)
+void common_speculative_set_skip_mtp(common_speculative * spec, bool skip) {
+    if (spec != nullptr) {
+        spec->skip_mtp = skip;
+    }
+}
+
 common_speculative_draft_result common_speculative_draft_ex(
         common_speculative * spec,
         llama_context * ctx,
@@ -1966,7 +1978,7 @@ common_speculative_draft_result common_speculative_draft_ex(
         spec->draft_seed = sampling != nullptr ? sampling->seed : LLAMA_DEFAULT_SEED;
     }
 
-    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_MTP)) {
+    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_MTP) && !spec->skip_mtp) {
         if (!common_speculative_ensure_sequence_hidden(spec, ctx, draft_seq_id, draft_base_pos - 1)) {
             LOG_ERR("%s: seq_id=%d MTP hidden state is empty during speculation\n",
                     __func__, (int) draft_seq_id);

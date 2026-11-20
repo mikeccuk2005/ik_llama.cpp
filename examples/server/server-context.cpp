@@ -3772,8 +3772,12 @@ void server_context::add_sampled_tokens() {
         // generate draft tokens in speculative decoding mode
         // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
         //       perform the speculative drafting for all sequences at the same time in a single batch
-        // --max-mtp-concurrent: a slot without a seat decodes root-only this step
-        const int n_draft_max_pre = mtp_seat_acquire(slot) ? slot.get_n_draft_max() : 0;
+        // --max-mtp-concurrent: a slot without a seat skips the MTP stage; other stages
+        // (e.g. ngram-mod) still draft, and with MTP as the only stage it decodes root-only
+        const bool has_seat = mtp_seat_acquire(slot);
+        const bool mtp_only = slot.uses_mtp() && !slot.params.speculative.has_composite_stage_chain();
+        common_speculative_set_skip_mtp(slot.spec, !has_seat);
+        const int n_draft_max_pre = (has_seat || !mtp_only) ? slot.get_n_draft_max() : 0;
         if (n_draft_max_pre > 0) {
             if (mctx && !server_speculative_multimodal_supported(slot.params.speculative)) {
                 GGML_ABORT("not supported by multimodal");

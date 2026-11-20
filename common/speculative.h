@@ -156,6 +156,9 @@ void common_speculative_apply_draft_threads(const common_params_speculative & sp
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
+// skip the MTP stage on the next drafts (other stages in the chain still run)
+void common_speculative_set_skip_mtp(common_speculative * spec, bool skip);
+
 bool common_speculative_before_draft(
     common_speculative * spec,
     llama_model * model,
