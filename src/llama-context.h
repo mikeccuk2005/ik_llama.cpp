@@ -415,6 +415,10 @@ struct llama_context {
 
     bool has_evaluated_once = false;
 
+    // NUMA expert cache: token counter and update budget (see --numa-expert-cache-mb)
+    int64_t numa_expcache_pending = 0;
+    int     numa_expcache_updates = 0;
+
     int64_t t_start_us;
     int64_t t_load_us;
     int64_t t_p_eval_us = 0;

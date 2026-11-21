@@ -65,6 +65,22 @@ On a hybrid MoE where expert tensors are the bulk of the weights this cuts the e
 `(N-1) x model` to roughly `(N-1) x dense-only`, at the cost of the expert reads that land on
 the other socket crossing the inter-socket link. KV mirroring is unchanged (`--numa-mirror kv`
 to turn it off).
+
+**`--numa-expert-cache-mb N`** gives every node a budget of N MB for copies of the expert tensors
+it reads most from its peer. The read path counts remote reads per tensor per node; after a short
+warm-up (256 tokens, then every 4096 tokens, at most 8 passes) each node copies its hottest
+non-local tensors into that budget. Promotion is fill-only: nothing is evicted, so a tensor is
+copied at most once per node. Budget `0` (default) disables the cache.
+
+```bash
+# experts shared, plus a 10 GB per-node cache of the hottest remote experts
+./build/bin/llama-server -m model.gguf --numa mirror-nonexp --numa-expert-cache-mb 10000
+```
+
+Watch the startup line (`NUMA expert cache: X GiB budget per node, Y expert tensors registered`)
+and the per-update line (`NUMA expert cache: update N promoted, node0 ... node1 ...`) to see what
+gets copied. Note the copy runs inside the decode call that triggers it, so the first promotion
+stalls generation for as long as the copy takes.
 - **Thread count:** token generation is memory-bandwidth bound and may peak *below* the full
   physical-core count; it can be worth sweeping `-t` to find the sweet spot for your machine.
 

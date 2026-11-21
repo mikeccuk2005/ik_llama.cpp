@@ -4994,6 +4994,9 @@ struct ggml_numa_nodes {
     enum ggml_numa_strategy numa_strategy;
     uint32_t mirror_flags; // ggml_numa_mirror_flags: what to duplicate per node when strategy == MIRROR
     int      nonexp_node;  // MIRROR_NONEXP only: node for expert tensors, -1 = alternate by layer
+    size_t   expcache_budget;                 // per-node expert cache budget in bytes (0 = off)
+    size_t   expcache_used[GGML_NUMA_MAX_NODES]; // bytes already promoted per node
+    void *   expcache_base[GGML_NUMA_MAX_NODES]; // reserved arena per node (budget bytes)
     struct ggml_numa_node nodes[GGML_NUMA_MAX_NODES];
     uint32_t n_nodes;
     uint32_t total_cpus; // hardware threads on system
@@ -5297,7 +5300,11 @@ bool ggml_is_numa(void) {
 
 // one node-local copy of a tensor's data per NUMA node. Stored behind ggml_tensor::data_numa.
 struct ggml_numa_mirror {
-    void * data[GGML_NUMA_MAX_NODES];
+    void *   data[GGML_NUMA_MAX_NODES];
+    uint64_t hits[GGML_NUMA_MAX_NODES];  // reads served remotely (data[node] == NULL): promotion score
+    size_t   bytes[GGML_NUMA_MAX_NODES]; // >0 when data[node] is an expert-cache slot
+    double   value[GGML_NUMA_MAX_NODES]; // decayed promotion score of the cached slot (eviction order)
+    int      owner;                      // node holding the single copy (-1 = fully mirrored)
 };
 
 // hot path: return the caller-thread's node-local copy of a (possibly view) tensor's data,
@@ -5309,7 +5316,12 @@ struct ggml_numa_mirror {
 static inline void * ggml_numa_tensor_data(const struct ggml_tensor * t, int node) {
     for (const struct ggml_tensor * a = t; a; a = a->view_src) {
         if (a->data_numa) {
-            void * base = ((const struct ggml_numa_mirror *) a->data_numa)->data[node];
+            struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) a->data_numa;
+            void * base = m->data[node];
+            if (!base && g_state.numa.expcache_budget > 0 && node != m->owner) {
+                // read from the peer node: this is the score the expert cache promotes on
+                __atomic_fetch_add(&m->hits[node], 1, __ATOMIC_RELAXED);
+            }
             // offset from the already-resolved pointers (t->data == a->data + accumulated view offs)
             return base ? (char *) base + ((const char *) t->data - (const char *) a->data) : t->data;
         }
@@ -5353,6 +5365,264 @@ int ggml_numa_nonexp_node_for_layer(int layer) {
 
 void ggml_numa_set_mirror(uint32_t flags) {
     g_state.numa.mirror_flags = flags;
+}
+
+//
+// per-node expert cache
+//
+// Each node keeps a byte budget of copies of tensors that live on the peer node. Which tensors to
+// copy is decided by remote-read counters kept per (tensor, node) on the read path (see
+// ggml_numa_tensor_data). Counters are windowed: every update halves them and decays each cached
+// slot's value, so a tensor that was hot once does not stay cached forever. When a hotter
+// candidate needs room, the least valuable cached slot on that node is evicted and its block goes
+// back to the free list (first-fit, split on the remainder).
+
+#define GGML_NUMA_EXPCACHE_MAX_TENSORS 4096
+#define GGML_NUMA_EXPCACHE_MAX_FREE    1024
+
+static struct ggml_tensor * g_numa_expcache[GGML_NUMA_EXPCACHE_MAX_TENSORS];
+static int g_numa_expcache_n = 0;
+
+struct ggml_numa_expcache_blk { size_t off; size_t size; };
+static struct ggml_numa_expcache_blk g_expcache_free[GGML_NUMA_MAX_NODES][GGML_NUMA_EXPCACHE_MAX_FREE];
+static int g_expcache_free_n[GGML_NUMA_MAX_NODES];
+
+void ggml_numa_expert_cache_set(size_t bytes_per_node) {
+    g_state.numa.expcache_budget = bytes_per_node;
+}
+
+size_t ggml_numa_expert_cache_budget(void) {
+    return g_state.numa.expcache_budget;
+}
+
+// first-fit inside one node's arena; *got receives the block size actually reserved
+static size_t ggml_numa_expcache_alloc_block(int n, size_t need, size_t * got) {
+    for (int i = 0; i < g_expcache_free_n[n]; ++i) {
+        if (g_expcache_free[n][i].size < need) {
+            continue;
+        }
+        const size_t off = g_expcache_free[n][i].off;
+        if (g_expcache_free[n][i].size - need >= 64) {
+            g_expcache_free[n][i].off  += need;
+            g_expcache_free[n][i].size -= need;
+            *got = need;
+        } else {
+            *got = g_expcache_free[n][i].size;
+            g_expcache_free[n][i] = g_expcache_free[n][--g_expcache_free_n[n]];
+        }
+        return off;
+    }
+    return (size_t) -1;
+}
+
+// hand a block back to the node's free list (after an eviction)
+static void ggml_numa_expcache_free_block(int n, size_t off, size_t size) {
+    if (g_expcache_free_n[n] < GGML_NUMA_EXPCACHE_MAX_FREE) {
+        g_expcache_free[n][g_expcache_free_n[n]].off  = off;
+        g_expcache_free[n][g_expcache_free_n[n]].size = size;
+        ++g_expcache_free_n[n];
+    }
+}
+
+// reserve one arena per node, sized to the budget. Called once from the layer-split code so the
+// slots exist before anything runs; promotion only ever copies into these slots.
+void ggml_numa_expert_cache_reserve(void) {
+    const size_t budget = g_state.numa.expcache_budget;
+    const int n_nodes = (int) g_state.numa.n_nodes;
+    if (budget == 0 || n_nodes < 2) {
+        return;
+    }
+    for (int n = 0; n < n_nodes; ++n) {
+        if (g_state.numa.expcache_base[n]) {
+            continue;
+        }
+        void * p = ggml_numa_alloc(budget, n);
+        if (!p) {
+            GGML_PRINT("numa expert cache: failed to reserve %.2f GiB on node %d\n", budget/1073741824.0, n);
+            continue;
+        }
+        g_state.numa.expcache_base[n] = p;
+        g_state.numa.expcache_used[n] = 0;
+        g_expcache_free_n[n] = 0;
+        ggml_numa_expcache_free_block(n, 0, budget);
+        GGML_PRINT_DEBUG("numa expert cache: reserved %.2f GiB on node %d\n", budget/1073741824.0, n);
+    }
+}
+
+// drop the reserved arenas and detach every cached slot (model teardown)
+void ggml_numa_expert_cache_release(void) {
+    for (int i = 0; i < g_numa_expcache_n; ++i) {
+        struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) g_numa_expcache[i]->data_numa;
+        if (!m) {
+            continue;
+        }
+        for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+            if (m->bytes[n] > 0) { // slot inside the arena, not ours to free individually
+                m->data[n]  = NULL;
+                m->bytes[n] = 0;
+                m->value[n] = 0.0;
+            }
+        }
+    }
+    const size_t budget = g_state.numa.expcache_budget;
+    for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+        if (g_state.numa.expcache_base[n]) {
+            ggml_numa_free(g_state.numa.expcache_base[n], budget);
+            g_state.numa.expcache_base[n] = NULL;
+        }
+        g_state.numa.expcache_used[n] = 0;
+        g_expcache_free_n[n] = 0;
+    }
+    g_numa_expcache_n = 0;
+}
+
+// make a tensor eligible for promotion; hits are counted in ggml_numa_tensor_data
+void ggml_numa_expert_cache_register(struct ggml_tensor * tensor, int owner_node) {
+    if (!tensor) {
+        return;
+    }
+    if (!tensor->data_numa) {
+        struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) calloc(1, sizeof(struct ggml_numa_mirror));
+        m->owner = -1;
+        tensor->data_numa = m;
+    }
+    ((struct ggml_numa_mirror *) tensor->data_numa)->owner = owner_node;
+    for (int i = 0; i < g_numa_expcache_n; ++i) {
+        if (g_numa_expcache[i] == tensor) {
+            return;
+        }
+    }
+    if (g_numa_expcache_n < GGML_NUMA_EXPCACHE_MAX_TENSORS) {
+        g_numa_expcache[g_numa_expcache_n++] = tensor;
+    }
+}
+
+// promote the hottest peer-owned tensors into each node's budget, evicting cold slots when full.
+// Returns true when anything was copied.
+bool ggml_numa_expert_cache_update(void) {
+    const size_t budget = g_state.numa.expcache_budget;
+    const int n_nodes = (int) g_state.numa.n_nodes;
+    if (budget == 0 || n_nodes < 2) {
+        return false;
+    }
+    bool promoted = false;
+    for (int n = 0; n < n_nodes; ++n) {
+        if (!g_state.numa.expcache_base[n]) {
+            continue;
+        }
+        // candidates: this window's remote-read counts, hottest first
+        struct cand { struct ggml_tensor * t; uint64_t hits; size_t bytes; };
+        static struct cand cands[GGML_NUMA_EXPCACHE_MAX_TENSORS];
+        int n_cand = 0;
+        for (int i = 0; i < g_numa_expcache_n; ++i) {
+            struct ggml_tensor * t = g_numa_expcache[i];
+            struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) t->data_numa;
+            if (!m || m->data[n] || m->bytes[n] > 0) {
+                continue; // already cached on this node
+            }
+            const uint64_t h = __atomic_load_n(&m->hits[n], __ATOMIC_RELAXED);
+            if (h == 0) {
+                continue;
+            }
+            cands[n_cand].t     = t;
+            cands[n_cand].hits  = h;
+            cands[n_cand].bytes = ggml_nbytes(t);
+            ++n_cand;
+        }
+        for (int i = 1; i < n_cand; ++i) { // insertion sort, hottest first
+            struct cand c = cands[i];
+            int j = i - 1;
+            while (j >= 0 && cands[j].hits < c.hits) {
+                cands[j + 1] = cands[j];
+                --j;
+            }
+            cands[j + 1] = c;
+        }
+
+        int promoted_here = 0;
+        int evicted_here  = 0;
+        for (int i = 0; i < n_cand; ++i) {
+            struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) cands[i].t->data_numa;
+            size_t blk = 0;
+            size_t off = ggml_numa_expcache_alloc_block(n, cands[i].bytes, &blk);
+            if (off == (size_t) -1) {
+                // full: evict the coldest cached slot if the candidate is hotter than it
+                int victim = -1;
+                double vmin = 0.0;
+                for (int j = 0; j < g_numa_expcache_n; ++j) {
+                    struct ggml_numa_mirror * vm = (struct ggml_numa_mirror *) g_numa_expcache[j]->data_numa;
+                    if (!vm || vm->bytes[n] == 0 || !vm->data[n]) {
+                        continue;
+                    }
+                    if (victim < 0 || vm->value[n] < vmin) {
+                        victim = j;
+                        vmin   = vm->value[n];
+                    }
+                }
+                if (victim < 0 || (double) cands[i].hits <= vmin) {
+                    continue;
+                }
+                struct ggml_numa_mirror * vm = (struct ggml_numa_mirror *) g_numa_expcache[victim]->data_numa;
+                const size_t voff = (size_t) ((char *) vm->data[n] - (char *) g_state.numa.expcache_base[n]);
+                ggml_numa_expcache_free_block(n, voff, vm->bytes[n]);
+                vm->data[n]  = NULL;
+                vm->bytes[n] = 0;
+                vm->value[n] = 0.0;
+                ++evicted_here;
+                off = ggml_numa_expcache_alloc_block(n, cands[i].bytes, &blk);
+                if (off == (size_t) -1) {
+                    continue;
+                }
+            }
+            memcpy((char *) g_state.numa.expcache_base[n] + off, cands[i].t->data, cands[i].bytes);
+            m->data[n]  = (char *) g_state.numa.expcache_base[n] + off;
+            m->bytes[n] = blk;
+            m->value[n] = (double) cands[i].hits;
+            ++promoted_here;
+            promoted = true;
+        }
+
+        // close the window: halve remote-read counts and decay every cached slot's value, so old
+        // heat fades and a slot that stops being useful becomes evictable
+        size_t used = 0;
+        for (int i = 0; i < g_numa_expcache_n; ++i) {
+            struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) g_numa_expcache[i]->data_numa;
+            if (!m) {
+                continue;
+            }
+            __atomic_store_n(&m->hits[n], __atomic_load_n(&m->hits[n], __ATOMIC_RELAXED) / 2, __ATOMIC_RELAXED);
+            m->value[n] *= 0.5;
+            used += m->bytes[n];
+        }
+        g_state.numa.expcache_used[n] = used;
+        GGML_PRINT_DEBUG("numa expert cache: node %d promoted %d, evicted %d, %.2f/%.2f GiB used\n",
+                n, promoted_here, evicted_here, used/1073741824.0, budget/1073741824.0);
+    }
+    return promoted;
+}
+void ggml_numa_expert_cache_stats(size_t * bytes_used, size_t * n_cached) {
+    for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+        if (bytes_used) {
+            bytes_used[n] = g_state.numa.expcache_used[n];
+        }
+        if (n_cached) {
+            n_cached[n] = 0;
+        }
+    }
+    if (!n_cached) {
+        return;
+    }
+    for (int i = 0; i < g_numa_expcache_n; ++i) {
+        struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) g_numa_expcache[i]->data_numa;
+        if (!m) {
+            continue;
+        }
+        for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+            if (m->bytes[n] > 0) {
+                n_cached[n]++;
+            }
+        }
+    }
 }
 
 uint32_t ggml_numa_get_mirror(void) {
@@ -5498,10 +5768,8 @@ void ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * nod
     int n = ggml_numa_node_count();
     struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) tensor->data_numa;
     if (!m) {
-        m = (struct ggml_numa_mirror *) malloc(sizeof(struct ggml_numa_mirror));
-        for (int i = 0; i < GGML_NUMA_MAX_NODES; ++i) {
-            m->data[i] = NULL;
-        }
+        m = (struct ggml_numa_mirror *) calloc(1, sizeof(struct ggml_numa_mirror));
+        m->owner = -1;
         tensor->data_numa = m;
     }
     for (int i = 0; i < n && i < GGML_NUMA_MAX_NODES; ++i) {
@@ -5511,6 +5779,7 @@ void ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * nod
 
 void ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor) {
     if (tensor->data_numa) {
+        // cache slots live inside the per-node arenas freed by ggml_numa_expert_cache_release()
         free(tensor->data_numa);
         tensor->data_numa = NULL;
     }

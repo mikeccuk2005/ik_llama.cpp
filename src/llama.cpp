@@ -427,6 +427,7 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
 
 llama_model::~llama_model() {
     // free NUMA mirror per-tensor pointer tables and the extra node-local weight copies
+    ggml_numa_expert_cache_release();
     for (struct ggml_context * ctx : ctxs) {
         for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             ggml_numa_tensor_clear_mirror(t);
@@ -9590,6 +9591,16 @@ static size_t llama_get_available_ram_bytes() {
 static size_t llama_get_available_ram_bytes() { return 0; }
 #endif
 
+// layer index parsed from a tensor name ("blk.<N>..."), -1 when absent
+static int llama_numa_layer_of(const char * name) {
+    const char * blk = strstr(name, "blk.");
+    int l = -1;
+    if (blk && sscanf(blk + 4, "%d.", &l) != 1) {
+        l = -1;
+    }
+    return l;
+}
+
 // MIRROR_NONEXP: mirror every weight tensor EXCEPT MoE expert tensors ("*exps*"). Experts keep a
 // single shared copy, bound per layer to one node, so a whole layer's expert compute stays on the
 // same domain and only the cross-layer alternation crosses the inter-socket link. Saves
@@ -9673,14 +9684,7 @@ static void llama_mirror_weights_nonexp(const llama_model & model) {
     int     cur_node  = 0;
     size_t  per_node[GGML_NUMA_MAX_NODES] = { 0 };
     for (auto * t : exps) {
-        int layer = cur_layer;
-        const char * blk = strstr(t->name, "blk.");
-        if (blk) {
-            int l = -1;
-            if (sscanf(blk + 4, "%d.", &l) == 1) {
-                layer = l;
-            }
-        }
+        const int layer = llama_numa_layer_of(t->name);
         if (layer != cur_layer) {
             cur_layer = layer;
             cur_node  = ggml_numa_nonexp_node_for_layer(layer < 0 ? 0 : layer);
@@ -9688,6 +9692,17 @@ static void llama_mirror_weights_nonexp(const llama_model & model) {
         const size_t nb = ggml_nbytes(t);
         ggml_numa_bind(t->data, nb, cur_node);
         per_node[cur_node] += nb;
+    }
+
+    // per-node expert cache: let the read path score these tensors and promote the hottest ones
+    if (ggml_numa_expert_cache_budget() > 0) {
+        for (auto * t : exps) {
+            const int layer = llama_numa_layer_of(t->name);
+            ggml_numa_expert_cache_register(t, ggml_numa_nonexp_node_for_layer(layer < 0 ? 0 : layer));
+        }
+        ggml_numa_expert_cache_reserve(); // slots are part of the split, not allocated mid-decode
+        LLAMA_LOG_INFO("%s: NUMA expert cache: %.2f GiB budget per node, %zu expert tensors registered\n",
+                __func__, ggml_numa_expert_cache_budget()/1073741824.0, exps.size());
     }
     LLAMA_LOG_INFO("%s: NUMA mirror-nonexp: %d dense tensors mirrored, %zu expert tensors kept single-copy "
             "(node0 %.2f GiB, node1 %.2f GiB), placement=%s\n", __func__, (int) dense.size(), exps.size(),
@@ -14397,6 +14412,24 @@ int32_t llama_decode(
     const int ret = llama_decode_internal(*ctx, batch);
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+    // NUMA expert cache: once the access pattern is visible, copy the hottest tensors each node
+    // reads from its peer into that node's budget. Warm up after a small batch, then every 4096
+    // tokens; each pass halves the hit counters and decays cached values, so cold slots age out.
+    if (ret == 0 && batch.n_tokens > 0 && ggml_numa_expert_cache_budget() > 0 && ctx->numa_expcache_updates < 64) {
+        ctx->numa_expcache_pending += batch.n_tokens;
+        const int64_t threshold = ctx->numa_expcache_updates == 0 ? 256 : 4096;
+        if (ctx->numa_expcache_pending >= threshold) {
+            const bool moved = ggml_numa_expert_cache_update();
+            size_t used[GGML_NUMA_MAX_NODES] = { 0 };
+            size_t ncach[GGML_NUMA_MAX_NODES] = { 0 };
+            ggml_numa_expert_cache_stats(used, ncach);
+            LLAMA_LOG_INFO("%s: NUMA expert cache: update %d %s, node0 %.2f GiB (%zu tensors), node1 %.2f GiB (%zu tensors)\n",
+                    __func__, ctx->numa_expcache_updates + 1, moved ? "promoted" : "no candidates",
+                    used[0]/1073741824.0, ncach[0], used[1]/1073741824.0, ncach[1]);
+            ctx->numa_expcache_pending = 0;
+            ++ctx->numa_expcache_updates;
+        }
     }
 
     return ret;

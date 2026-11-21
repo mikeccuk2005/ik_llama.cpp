@@ -2644,6 +2644,12 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.numa_nonexp_node = std::atoi(argv[i]);    // -1 = alternate layers across nodes
         return true;
     }
+    if (arg == "--numa-expert-cache-mb") {
+        CHECK_ARG
+        params.numa = GGML_NUMA_STRATEGY_MIRROR_NONEXP; // implies mirror-nonexp
+        params.numa_expert_cache_mb = (size_t) std::max(0, std::atoi(argv[i]));
+        return true;
+    }
     if (arg == "-dev" || arg == "--device") {
         CHECK_ARG
         std::string value(argv[i]);
@@ -3727,6 +3733,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "  weights, kv, all, none (default: all). implies --numa mirror" });
     options.push_back({ "*",           "       --numa-nonexp-node N",   "with --numa mirror-nonexp: NUMA node holding the single shared copy of\n"
                                                                         "expert tensors (default -1: alternate layers across nodes)" });
+    options.push_back({ "*",           "       --numa-expert-cache-mb N","with --numa mirror-nonexp: per-node budget (MB) for copies of the expert\n"
+                                                                        "tensors that node reads most from its peer. 0 disables (default)" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",
@@ -4523,6 +4531,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         ggml_numa_set_mirror(params.numa_mirror);
         if (params.numa == GGML_NUMA_STRATEGY_MIRROR_NONEXP) {
             ggml_numa_set_nonexp_node(params.numa_nonexp_node);
+            ggml_numa_expert_cache_set(params.numa_expert_cache_mb * 1024ull * 1024ull);
         }
     }
 

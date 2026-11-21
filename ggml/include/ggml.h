@@ -998,6 +998,16 @@ extern "C" {
     GGML_API void     ggml_numa_set_nonexp_node(int node);         // -1 = alternate by layer index
     GGML_API int      ggml_numa_get_nonexp_node(void);             // requested node, -1 when alternating
     GGML_API int      ggml_numa_nonexp_node_for_layer(int layer);  // resolve the node for one layer
+    // Per-node expert cache (used with MIRROR_NONEXP): each node gets its own byte budget and
+    // lazily copies the tensors it reads most from the other node. Hits are counted on the read
+    // path, promotions run in ggml_numa_expert_cache_update().
+    GGML_API void       ggml_numa_expert_cache_set(size_t bytes_per_node); // 0 disables
+    GGML_API size_t     ggml_numa_expert_cache_budget(void);
+    GGML_API void       ggml_numa_expert_cache_register(struct ggml_tensor * tensor, int owner_node);
+    GGML_API void       ggml_numa_expert_cache_reserve(void);   // reserve the per-node arenas (call once, after the layer split)
+    GGML_API void       ggml_numa_expert_cache_release(void);   // free the arenas (model teardown)
+    GGML_API bool       ggml_numa_expert_cache_update(void);   // true when something was promoted
+    GGML_API void       ggml_numa_expert_cache_stats(size_t * bytes_used, size_t * n_cached); // per node arrays
     GGML_API int      ggml_numa_node_for_thread(int ith, int nth); // block split of threads across nodes
     // allocate/free memory bound to a specific NUMA node (mmap + mbind + THP)
     GGML_API void *   ggml_numa_alloc(size_t size, int node);
