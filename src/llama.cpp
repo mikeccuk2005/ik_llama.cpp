@@ -14459,6 +14459,13 @@ static int llama_decode_split_by_node(llama_context & lctx, llama_batch batch) {
         return -2;
     }
 
+    // Only decode-shaped batches split. Under continuous batching a prompt chunk can also carry
+    // tokens for several slots, and splitting those would run prefill at half the team. A decode
+    // step is at most (1 + n_draft) tokens per slot, so anything wider is prompt work.
+    if (n_tokens > 40 * lctx.cparams.n_seq_max) {
+        return -2;
+    }
+
     const llama_seq_id seq_mid = (llama_seq_id) (lctx.cparams.n_seq_max / 2);
 
     uint32_t n_node0 = 0;

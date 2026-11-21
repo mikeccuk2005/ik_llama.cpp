@@ -3175,6 +3175,11 @@ struct ggml_compute_state_shared {
     atomic_int n_barrier;
     atomic_int n_barrier_passed;
 
+    // sub-team (per-node decode) barrier, kept separate so mixing team sizes across passes
+    // cannot drift the counters the full-team path uses
+    atomic_int n_barrier_sub;
+    atomic_int n_barrier_passed_sub;
+
     ggml_abort_callback abort_callback; // abort ggml_graph_compute when true
     void * abort_callback_data;
 
@@ -5110,13 +5115,16 @@ static void ggml_numa_hier_barrier(void) {
     }
 }
 
-static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) {
+// ggml_barrier_impl: flat barrier over the whole team, or over a per-node sub-team when sub != 0.
+// Sub-teams get their own counters: alternating 64-thread and 32-thread passes on one set of
+// counters drifts them and deadlocks.
+static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared, int sub) {
     if (shared->n_threads == 1) {
         return;
     }
 
-    atomic_int * n_barrier = &shared->n_barrier;
-    atomic_int * n_barrier_passed = &shared->n_barrier_passed;
+    atomic_int * n_barrier = sub ? &shared->n_barrier_sub : &shared->n_barrier;
+    atomic_int * n_barrier_passed = sub ? &shared->n_barrier_passed_sub : &shared->n_barrier_passed;
 
     int n_threads = shared->n_threads;
     int passed_old = atomic_load(n_barrier_passed);
@@ -5150,16 +5158,17 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
         return;
     }
     // sub-team compute (per-node decode): one node's threads only, so the NUMA split
-    // barrier's node counts don't apply. A plain OpenMP barrier is exact over the sub-team.
+    // barrier's node counts don't apply. Use private counters: the shared ones are sized for
+    // the full team and drift if 64-thread and 32-thread passes alternate.
     if (shared->ith_total != shared->n_threads) {
-        #pragma omp barrier
+        ggml_barrier_impl(shared, 1);
         return;
     }
     // prompt processing (large batch) is compute-bound; keep its original barrier. Only token
     // generation (small batch) was barrier-bound, so that's the only path the hierarchical
     // barrier replaces — applying it to PP just adds 2-level latency with no contention to save.
     if (shared && shared->n_batch > 32) {
-        ggml_barrier_impl(shared);
+        ggml_barrier_impl(shared, 0);
         return;
     }
     if (g_numa_barrier.active) {
@@ -5174,14 +5183,14 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
         return;
     }
     if (shared->ith_total != shared->n_threads) {
-        ggml_barrier_impl(shared);
+        ggml_barrier_impl(shared, 1);
         return;
     }
     if (g_numa_barrier.active && !(shared && shared->n_batch > 32)) {
         ggml_numa_hier_barrier();
         return;
     }
-    ggml_barrier_impl(shared);
+    ggml_barrier_impl(shared, 0);
 }
 #endif
 
