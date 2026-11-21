@@ -7523,6 +7523,7 @@ static void llama_graph_compute(
 
     if (lctx.backend_cpu != nullptr) {
         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
+        ggml_backend_cpu_set_ith_range(lctx.backend_cpu, (int) lctx.cparams.ith_offset, (int) lctx.cparams.ith_total);
         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
     }
@@ -7546,6 +7547,7 @@ static void llama_graph_compute_sched(
 
     if (lctx.backend_cpu != nullptr) {
         ggml_backend_cpu_set_n_threads(lctx.backend_cpu, n_threads);
+        ggml_backend_cpu_set_ith_range(lctx.backend_cpu, (int) lctx.cparams.ith_offset, (int) lctx.cparams.ith_total);
         ggml_backend_cpu_set_abort_callback(lctx.backend_cpu, lctx.abort_callback, lctx.abort_callback_data);
         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
     }
@@ -7612,7 +7614,9 @@ static bool prepare_mtp_graph_inputs(
 //
 static int llama_decode_internal(
          llama_context & lctx,
-           llama_batch   batch_all) { // TODO: rename back to batch
+           llama_batch   batch_all,
+                int32_t  out_base = 0,    // output row offset (per-node split)
+                int32_t  tok_base = 0) {  // index of batch_all.token[0] in the caller's batch
 
     lctx.is_encoding = false;
     const uint32_t n_tokens_all = batch_all.n_tokens;
@@ -7681,7 +7685,8 @@ static int llama_decode_internal(
     n_outputs_embd = has_mtp && cparams.mtp_op_type == MTP_OP_NONE ? n_tokens_all : n_outputs;
     const size_t required_outputs = std::max<size_t>(n_outputs, n_outputs_embd);
     const bool is_dflash_decode = llm_arch_is_dflash_family(lctx.model.arch);
-    const size_t reserved_outputs = llama_output_reserve(lctx, required_outputs, n_outputs, n_outputs_embd);
+    // out_base rows were already emitted by an earlier split half: size for the total
+    const size_t reserved_outputs = llama_output_reserve(lctx, required_outputs + out_base, n_outputs + out_base, n_outputs_embd);
     if (reserved_outputs < required_outputs) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %zu outputs\n", __func__, required_outputs);
         return -2;
@@ -7692,7 +7697,7 @@ static int llama_decode_internal(
         int32_t i_logits = 0;
         for (uint32_t i = 0; i < n_tokens_all; ++i) {
             if (batch_all.logits[i]) {
-                lctx.output_ids[i] = i_logits++;
+                lctx.output_ids[tok_base + i] = out_base + i_logits++;
             } else {
                 lctx.output_ids[i] = -1;
             }
@@ -8267,12 +8272,12 @@ static int llama_decode_internal(
                 GGML_ASSERT(backend_res != nullptr);
                 GGML_ASSERT(lctx.logits != nullptr);
 
-                float * logits_out = lctx.logits + n_outputs_prev*n_vocab;
+                float * logits_out = lctx.logits + (size_t)(out_base + n_outputs_prev)*n_vocab;
                 const int32_t n_outputs_new = lctx.n_outputs;
 
                 if (n_outputs_new) {
-                    GGML_ASSERT( n_outputs_prev + n_outputs_new <= n_outputs);
-                    GGML_ASSERT((n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
+                    GGML_ASSERT((uint32_t)(out_base + n_outputs_prev + n_outputs_new) <= n_outputs + out_base);
+                    GGML_ASSERT((int64_t)(out_base + n_outputs_prev + n_outputs_new)*n_vocab <= (int64_t) lctx.logits_size);
 
                     if (res->ne[1] == n_tokens && n_outputs_new < n_tokens) {
                         int32_t i_out = 0;
@@ -8384,7 +8389,7 @@ static int llama_decode_internal(
     }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
-    lctx.n_outputs = n_outputs;
+    lctx.n_outputs = (uint32_t) out_base + n_outputs;
     lctx.n_outputs_embd = n_outputs_embd;
 
     // put the output rows back into the caller's token order after a regroup
@@ -9720,7 +9725,11 @@ static void llama_mirror_model_weights(const llama_model & model) {
     if (!model.numa_mirror_bufs.empty()) {
         return; // already mirrored (e.g. a second context created on the same model)
     }
-    if (ggml_numa_nonexp_active()) {
+    // An MTP companion (draft) model is tiny - a few GiB - and runs a forward pass on every decode
+    // step for every slot, so splitting its expert tensors across nodes costs a UPI read per draft
+    // token. Mirror it whole: the extra RAM is small, and every draft on either node stays local.
+    const bool mtp_companion = llama_model_mtp_package(&model) == LLAMA_MTP_PACKAGE_COMPANION;
+    if (ggml_numa_nonexp_active() && !mtp_companion) {
         llama_mirror_weights_nonexp(model);
         return;
     }
@@ -10153,6 +10162,9 @@ struct llama_context * llama_init_from_model(
     cparams.n_seq_max        = std::max(1u, params.n_seq_max);
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
+    cparams.ith_offset       = 0;
+    cparams.ith_total        = 0;
+    cparams.numa_slot_split  = 0;
     cparams.yarn_ext_factor  = params.yarn_ext_factor >= 0.0f ? params.yarn_ext_factor : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast   = params.yarn_beta_fast >= 0.0f ? params.yarn_beta_fast : hparams.yarn_beta_fast;
@@ -14311,6 +14323,26 @@ void llama_set_n_threads(struct llama_context * ctx, uint32_t n_threads, uint32_
     ctx->cparams.n_threads_batch = n_threads_batch;
 }
 
+// llama_set_ith_range: run this context's computes on a slice of the thread team.
+// With a 2-node mirror and n_threads = 64, offset 0 keeps the context on node 0 and
+// offset 32 puts it on node 1, because NUMA placement maps ith -> node out of ith_total.
+void llama_set_ith_range(struct llama_context * ctx, uint32_t ith_offset, uint32_t ith_total) {
+    ctx->cparams.ith_offset = ith_offset;
+    ctx->cparams.ith_total  = ith_total;
+}
+
+// llama_set_numa_slot_split: split mixed-socket decode batches into one pass per NUMA node.
+// Slots [0, n_seq_max/2) decode on node 0 (ith range [0, n_threads/2)) and the rest on node 1.
+// Prefill batches keep the full team. 0 disables the split.
+void llama_set_numa_slot_split(struct llama_context * ctx, uint32_t enable) {
+    ctx->cparams.numa_slot_split = enable;
+}
+
+void llama_get_ith_range(const struct llama_context * ctx, uint32_t * ith_offset, uint32_t * ith_total) {
+    if (ith_offset) *ith_offset = ctx->cparams.ith_offset;
+    if (ith_total)  *ith_total  = ctx->cparams.ith_total;
+}
+
 void llama_set_cpu_affinity(struct llama_context * ctx, const int32_t * cpus, int n_cpus) {
     if (ctx->backend_cpu == nullptr) {
         return;
@@ -14406,10 +14438,143 @@ int32_t llama_encode(
     return ret;
 }
 
+// llama_decode_split_by_node: run one decode batch as two per-socket halves.
+//
+// Slots are bound to sockets by seq id: [0, n_seq_max/2) on node 0, the rest on node 1, which
+// is how the mirror assigns CPU affinity (ith*2/64). Each half is computed by that node's
+// threads only (ith range [0,32) or [32,64) of a 64-thread team), so a decode step touches
+// nothing across UPI: no cross-socket barrier, no remote weights, no remote kernel reads.
+//
+// Only batches whose node-0 tokens come first are split, so the output rows of half 1 land
+// exactly where the unsplit batch would have put them (row i == row i). Anything unusual
+// (multi-seq tokens, embeddings, no logits map, interleaved seqs) falls back to one call.
+static int llama_decode_split_by_node(llama_context & lctx, llama_batch batch) {
+    const uint32_t n_tokens = batch.n_tokens;
+    if (n_tokens < 2 || batch.embd != nullptr || batch.logits == nullptr || batch.n_seq_id == nullptr) {
+        return -2; // not a candidate: caller falls back
+    }
+
+    const uint32_t half = lctx.cparams.n_threads / 2;
+    if (half == 0) {
+        return -2;
+    }
+
+    const llama_seq_id seq_mid = (llama_seq_id) (lctx.cparams.n_seq_max / 2);
+
+    uint32_t n_node0 = 0;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || batch.seq_id[i] == nullptr) {
+            return -2;
+        }
+        if (batch.seq_id[i][0] < seq_mid) {
+            if (n_node0 != i) {
+                return -2; // interleaved: output rows would move
+            }
+            ++n_node0;
+        }
+    }
+    if (n_node0 == 0 || n_node0 == n_tokens) {
+        return -2; // single-socket batch, nothing to split (this is the prefill path)
+    }
+
+    auto build_half = [&](uint32_t i0, uint32_t i1) {
+        llama_batch b = {};
+        b.n_tokens = (int32_t) (i1 - i0);
+        b.token    = batch.token    ? batch.token    + i0 : nullptr;
+        b.pos      = batch.pos      ? batch.pos      + i0 : nullptr;
+        b.logits   = batch.logits   ? batch.logits   + i0 : nullptr;
+        b.n_seq_id = batch.n_seq_id ? batch.n_seq_id + i0 : nullptr;
+        b.seq_id   = batch.seq_id   ? batch.seq_id   + i0 : nullptr;
+        return b;
+    };
+
+    // rows produced by the first half, so the second half appends instead of overwriting
+    int32_t n_out0 = 0;
+    for (uint32_t i = 0; i < n_node0; ++i) {
+        n_out0 += batch.logits[i] != 0;
+    }
+
+    // Reserve for BOTH halves up front. Each llama_decode_internal() call reserves only its own
+    // row count, so without this the second call reallocates lctx.buf_output and the rows the
+    // first half already wrote are lost (slots then sample garbage).
+    uint32_t n_out_total = 0;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        n_out_total += batch.logits[i] != 0;
+    }
+    if (llama_output_reserve(lctx, n_out_total, n_out_total, n_out_total) < n_out_total) {
+        return -2; // cannot size the output buffer: fall back to one call
+    }
+
+    const uint32_t n_threads_old     = lctx.cparams.n_threads;
+    const uint32_t n_threads_batch   = lctx.cparams.n_threads_batch;
+    const uint32_t ith_offset_old    = lctx.cparams.ith_offset;
+    const uint32_t ith_total_old     = lctx.cparams.ith_total;
+
+    // both halves are "decode shaped": force the per-node team size even for multi-token halves
+    lctx.cparams.n_threads       = half;
+    lctx.cparams.n_threads_batch = half;
+    lctx.cparams.ith_total       = half * 2;
+
+    llama_batch b0 = build_half(0, n_node0);
+    llama_batch b1 = build_half(n_node0, n_tokens);
+
+    if (getenv("LLAMA_SPLIT_DEBUG")) {
+        LLAMA_LOG_INFO("split: n_tokens=%u n_node0=%u out0=%d nth=%u half=%u seq_mid=%d\n",
+                n_tokens, n_node0, n_out0, lctx.cparams.n_threads, half, (int) seq_mid);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            LLAMA_LOG_INFO("  tok[%u] id=%d pos=%d seq=%d logits=%d\n", i,
+                    batch.token ? batch.token[i] : -1,
+                    batch.pos   ? batch.pos[i]   : -1,
+                    (int) batch.seq_id[i][0], (int) batch.logits[i]);
+        }
+    }
+
+    // debug knob: run both halves on the node-0 team to tell a structure bug from a range bug
+    const bool no_offset = getenv("LLAMA_SPLIT_NOOFFSET") != nullptr;
+
+    lctx.cparams.ith_offset = 0;
+    int ret = llama_decode_internal(lctx, b0, 0);
+
+    // decode_internal returns without synchronizing (see the commented-out call at its end), so
+    // the second pass must not start while pass 0 may still be writing outputs or KV.
+    llama_synchronize(&lctx);
+
+    if (ret >= 0) {
+        lctx.cparams.ith_offset = no_offset ? 0 : half;
+        // out_base = rows already produced by half 0, so llama_get_logits_ith(i) keeps working
+        ret = llama_decode_internal(lctx, b1, n_out0, (int32_t) n_node0);
+    }
+
+    if (ret >= 0) {
+        // llama_output_reserve() fills output_ids with -1 on every decode call, so pass 1 erased
+        // the map pass 0 wrote. Rebuild it for the whole batch: halves are prefix-ordered, so rows
+        // run 0..n_out_total-1 in original token order, which is exactly where each pass wrote them.
+        int32_t row = 0;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            lctx.output_ids[i] = batch.logits[i] ? row++ : -1;
+        }
+        lctx.n_outputs = (uint32_t) n_out_total;
+    }
+
+    lctx.cparams.n_threads       = n_threads_old;
+    lctx.cparams.n_threads_batch = n_threads_batch;
+    lctx.cparams.ith_offset      = ith_offset_old;
+    lctx.cparams.ith_total       = ith_total_old;
+
+    return ret;
+}
+
 int32_t llama_decode(
         struct llama_context * ctx,
           struct llama_batch   batch) {
-    const int ret = llama_decode_internal(*ctx, batch);
+    // per-socket decode: only when asked for, and only for mixed-socket batches
+    int ret = -2;
+    if (ctx->cparams.numa_slot_split > 0) {
+        ret = llama_decode_split_by_node(*ctx, batch);
+    }
+    if (ret == -2) {
+        ret = llama_decode_internal(*ctx, batch);
+    }
     if (ret < 0) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

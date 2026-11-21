@@ -810,6 +810,10 @@ struct ggml_backend_cpu_context {
     // optional per-thread CPU affinity
     int32_t cpu_affinity[GGML_MAX_CPU_AFFINITY];
     int32_t n_cpu_affinity;
+
+    // sub-team range: workers cover ith = ith_offset + [0, n_threads) of ith_total
+    int ith_offset;
+    int ith_total;
 };
 
 GGML_CALL static const char * ggml_backend_cpu_name(ggml_backend_t backend) {
@@ -899,6 +903,8 @@ GGML_CALL static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t 
     cplan.moe_expert_prefetch = cpu_ctx->moe_expert_prefetch;
     cplan.cpu_affinity        = cpu_ctx->cpu_affinity;
     cplan.n_cpu_affinity      = cpu_ctx->n_cpu_affinity;
+    cplan.ith_offset          = cpu_ctx->ith_offset;
+    cplan.ith_total           = cpu_ctx->ith_total > 0 ? cpu_ctx->ith_total : cpu_ctx->n_threads;
 
     return ggml_graph_compute(cgraph, &cplan);
 }
@@ -979,6 +985,8 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->abort_callback_data = NULL;
     ctx->moe_expert_prefetch = false;
     ctx->n_cpu_affinity      = 0;
+    ctx->ith_offset          = 0;
+    ctx->ith_total           = 0;
 
     ggml_backend_t cpu_backend = (ggml_backend_t)malloc(sizeof(struct ggml_backend));
     if (cpu_backend == NULL) {
@@ -1003,6 +1011,17 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->n_threads = n_threads;
+}
+
+// set_ith_range: restrict this backend's computes to a slice of the full thread team.
+// Used to run one NUMA node's slots on that node's threads only: offset 0 with total 64
+// means "workers 0..n_threads-1 of a 64-thread team", so NUMA placement keeps them local.
+void ggml_backend_cpu_set_ith_range(ggml_backend_t backend_cpu, int ith_offset, int ith_total) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
+
+    struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+    ctx->ith_offset = ith_offset;
+    ctx->ith_total  = ith_total;
 }
 
 void ggml_backend_cpu_set_moe_expert_prefetch(ggml_backend_t backend_cpu, bool enable) {

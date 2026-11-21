@@ -3167,6 +3167,10 @@ struct ggml_compute_state_shared {
     int n_threads;
     int n_batch;
 
+    // team geometry: workers are ith = ith_offset + [0, n_threads), out of ith_total
+    int ith_offset;
+    int ith_total;
+
     // synchronization primitives
     atomic_int n_barrier;
     atomic_int n_barrier_passed;
@@ -5145,6 +5149,12 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
     }
+    // sub-team compute (per-node decode): one node's threads only, so the NUMA split
+    // barrier's node counts don't apply. A plain OpenMP barrier is exact over the sub-team.
+    if (shared->ith_total != shared->n_threads) {
+        #pragma omp barrier
+        return;
+    }
     // prompt processing (large batch) is compute-bound; keep its original barrier. Only token
     // generation (small batch) was barrier-bound, so that's the only path the hierarchical
     // barrier replaces — applying it to PP just adds 2-level latency with no contention to save.
@@ -5161,6 +5171,10 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
 #else
 static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
+        return;
+    }
+    if (shared->ith_total != shared->n_threads) {
+        ggml_barrier_impl(shared);
         return;
     }
     if (g_numa_barrier.active && !(shared && shared->n_batch > 32)) {
@@ -30914,11 +30928,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = state->shared->cgraph;
     const struct ggml_cplan  * cplan  = state->shared->cplan;
 
-    set_numa_thread_affinity(state->ith, state->shared->n_threads);
-    set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
+    // ith is absolute in the full team (it decides the NUMA node); kernels want the
+    // relative index inside this sub-team so work slicing stays 0..n_th-1.
+    const int ith_rel = state->ith - state->shared->ith_offset;
+
+    set_numa_thread_affinity(state->ith, state->shared->ith_total);
+    set_cpu_thread_affinity(cplan, ith_rel); // explicit affinity takes precedence over NUMA
 
     struct ggml_compute_params params = {
-        /*.ith   =*/ state->ith,
+        /*.ith   =*/ (size_t) ith_rel,
         /*.nth   =*/ state->shared->n_threads,
         /*.wsize =*/ cplan->work_size,
         /*.wdata =*/ cplan->work_data,
@@ -30944,7 +30962,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         t_eval += tim2 - tim1;
 #endif
 
-        if (state->ith == 0 && cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
+        if (ith_rel == 0 && cplan->abort_callback && cplan->abort_callback(cplan->abort_callback_data)) {
             state->shared->ec = GGML_STATUS_ABORTED;
         }
 
@@ -30969,6 +30987,17 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     int n_threads = cplan->n_threads;
 
+    // sub-team geometry: within a graph, workers cover [ith_offset, ith_offset + n_threads)
+    // of an ith_total-sized team. Defaults keep the old behaviour (whole team).
+    int ith_offset = cplan->ith_offset;
+    int ith_total  = cplan->ith_total > 0 ? cplan->ith_total : n_threads;
+    GGML_ASSERT(ith_total >= ith_offset + n_threads && "ith range exceeds the team");
+#ifdef GGML_USE_OPENMP
+    // OpenMP worker ids are 0..n-1; the offset is added to them below, so a sub-team
+    // still reports the absolute ith that NUMA placement divides by.
+    GGML_ASSERT(ith_offset + n_threads <= ith_total);
+#endif
+
 #if defined(__gnu_linux__)
     // the calling thread is worker 0 and gets pinned below; remember its affinity
     cpu_set_t saved_affinity;
@@ -30982,6 +31011,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         /*.cgraph_plan             =*/ cplan,
         /*.n_threads               =*/ n_threads,
         /*.n_batch                 =*/ cgraph->n_batch,
+        /*.ith_offset              =*/ ith_offset,
+        /*.ith_total               =*/ ith_total,
         /*.n_barrier               =*/ 0,
         /*.n_barrier_passed        =*/ 0,
         /*.abort_callback          =*/ NULL,
@@ -31009,7 +31040,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
             struct ggml_compute_state worker = {
                 .thrd   = 0,
-                .ith    = omp_get_thread_num(),
+                .ith    = ith_offset + omp_get_thread_num(),
                 .shared = &state_shared,
             };
             ggml_graph_compute_thread(&worker);
@@ -31032,7 +31063,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     for (int j = 0; j < n_threads; ++j) {
         workers[j] = (struct ggml_compute_state) {
             .thrd   = 0,
-            .ith    = j,
+            .ith    = ith_offset + j,
             .shared = &state_shared,
         };
     }

@@ -893,6 +893,13 @@ extern "C" {
         // optional CPU affinity: pin worker ith to cpu_affinity[ith % n_cpu_affinity]
         const int32_t * cpu_affinity;
         int32_t         n_cpu_affinity;
+
+        // Thread range for this compute: workers are numbered ith = ith_offset + j with
+        // j in [0, n_threads). ith_total is the size of the whole team and is what NUMA
+        // placement divides by, so a sub-team keeps the node that its offset selects.
+        // Zero means "full team": ith_offset 0 and ith_total = n_threads.
+        int ith_offset;
+        int ith_total;
     };
 
     enum ggml_cgraph_eval_order {

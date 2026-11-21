@@ -12,6 +12,14 @@ struct llama_cparams {
     uint32_t n_threads;       // number of threads to use for generation
     uint32_t n_threads_batch; // number of threads to use for batch processing
 
+    // sub-team range for per-NUMA-node decode: this context's workers are
+    // ith = ith_offset + [0, n_threads) out of ith_total. Zero = whole team.
+    uint32_t ith_offset;
+    uint32_t ith_total;
+
+    // split a mixed-socket decode batch into one pass per NUMA node (0 = off)
+    uint32_t numa_slot_split;
+
     std::vector<std::string> devices;
     std::vector<std::string> devices_draft;
 

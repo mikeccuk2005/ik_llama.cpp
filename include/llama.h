@@ -1214,6 +1214,16 @@ extern "C" {
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
     LLAMA_API void llama_set_n_threads(struct llama_context * ctx, uint32_t n_threads, uint32_t n_threads_batch);
+    // Restrict this context to a slice of the thread team: workers are
+    // ith = ith_offset + [0, n_threads) out of ith_total. Use (0, 64) and (32, 64)
+    // to keep two contexts on two NUMA nodes. (0, 0) restores the whole team.
+    LLAMA_API void llama_set_ith_range(struct llama_context * ctx, uint32_t ith_offset, uint32_t ith_total);
+
+    LLAMA_API void llama_get_ith_range(const struct llama_context * ctx, uint32_t * ith_offset, uint32_t * ith_total);
+
+    // Split mixed-socket decode batches into one pass per NUMA node: slots [0, n_seq_max/2)
+    // run on node 0's half of the thread team, the rest on node 1's. Prefill stays whole-team.
+    LLAMA_API void llama_set_numa_slot_split(struct llama_context * ctx, uint32_t enable);
 
     // pin CPU worker threads to the given logical CPUs (Linux only); thread t ->
     // cpus[t % n_cpus]. Configure before compute, n_cpus == 0 disables pinning.
