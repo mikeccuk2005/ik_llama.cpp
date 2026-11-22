@@ -4537,6 +4537,18 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
     // apply any --numa-mirror component customization before the model / context are built
     // (ggml_numa_init already defaulted this to "all" when --numa mirror was selected).
+    if (params.numa_slot_split > 0 && params.numa_expert_cache_mb > 0) {
+        // The cache promotes the experts a node reads from its peer. Under the split every pass
+        // touches every layer, so each node reads both halves of the expert set and the per-node
+        // counters flip every step: the cache promotes and evicts continuously and decode
+        // collapses (0.31 t/s against 3.1 with it disabled). Must run before the mirror setup
+        // below, which reads the budget when it registers the expert tensors.
+        LOG_WRN("%s: --numa-slot-split ignores --numa-expert-cache-mb %zu: each half touches every "
+                "layer, so a per-node cache thrashes instead of helping\n",
+                __func__, params.numa_expert_cache_mb);
+        params.numa_expert_cache_mb = 0;
+    }
+
     if (params.numa == GGML_NUMA_STRATEGY_MIRROR || params.numa == GGML_NUMA_STRATEGY_MIRROR_NONEXP) {
         ggml_numa_set_mirror(params.numa_mirror);
         if (params.numa == GGML_NUMA_STRATEGY_MIRROR_NONEXP) {
