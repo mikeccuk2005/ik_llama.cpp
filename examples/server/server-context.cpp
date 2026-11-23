@@ -406,7 +406,10 @@ void server_context::init() {
 
     if (params_base.has_mtp) {
         SRV_INF("%s\n", "MTP needs embeddings on decode, enabling");
-        llama_set_embeddings(ctx, true);
+        // every per-NUMA context carries slots of its own, so all of them need embeddings
+        for (auto * c : (ctxs.empty() ? std::vector<llama_context *>{ctx} : ctxs)) {
+            llama_set_embeddings(c, true);
+        }
     }
 
     const bool requested_spec = params_base.speculative.has_stage_chain();
@@ -483,6 +486,22 @@ void server_context::init() {
                     return;
                 }
                 SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+                if (n_ctx_split > 1) {
+                    // The draft head lives in its own context, created by the spec layer without a
+                    // thread range, so it would run unpinned across both sockets. Pin it to the
+                    // slot's node: the head is small, latency matters more than its bandwidth.
+                    int ci = 0;
+                    for (size_t k = 0; k < ctxs.size(); ++k) {
+                        if (ctxs[k] == slot.ctx) { ci = (int) k; break; }
+                    }
+                    const int n_thr_team = (int) params_base.n_threads;
+                    for (const auto * dc : common_speculative_get_draft_contexts(slot.spec)) {
+                        auto * dcw = const_cast<llama_context *>(dc);
+                        // one socket's worth of threads, on the slot's node
+                        llama_set_n_threads(dcw, n_thr_team, n_thr_team);
+                        llama_set_ith_range(dcw, ci * n_thr_team, n_thr_team * n_ctx_split);
+                    }
+                }
                 break;
             case COMMON_SPECULATIVE_INIT_ERR_RECURRENT:
                 SRV_ERR("%s", "failed to initialize recurrent speculative context\n");
