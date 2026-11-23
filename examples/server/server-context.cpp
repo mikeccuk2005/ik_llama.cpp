@@ -5218,6 +5218,10 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             return ctx;
         };
 
+        // A run is one contiguous block of tokens sharing a context. Blocks stay whole only when
+        // every sequence in them appears once (the decode shape). llama's hybrid path clamps a
+        // batch that repeats a sequence into per-sequence chunks and only the last chunk keeps its
+        // output_ids, which silently kills the logits of the earlier slots.
         std::vector<decode_run> runs;
         for (int32_t t = 0; t < n_tokens; ) {
             llama_context * c = ctx_for_token(t);
@@ -5225,7 +5229,23 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             while (e < n_tokens && ctx_for_token(e) == c) {
                 ++e;
             }
-            runs.push_back({ t, e - t, c });
+            bool repeats = false;
+            for (int32_t a = t; a < e && !repeats; ++a) {
+                for (int32_t b = a + 1; b < e; ++b) {
+                    if (batch.seq_id[a][0] == batch.seq_id[b][0]) { repeats = true; break; }
+                }
+            }
+            if (!repeats) {
+                runs.push_back({ t, e - t, c });
+            } else {
+                for (int32_t a = t; a < e; ) {
+                    const llama_seq_id sid = batch.seq_id[a][0];
+                    int32_t b = a + 1;
+                    while (b < e && batch.seq_id[b][0] == sid) { ++b; }
+                    runs.push_back({ a, b - a, c });
+                    a = b;
+                }
+            }
             t = e;
         }
 
@@ -5254,7 +5274,24 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         };
 
         int ret = 0;
-        if (runs.size() == 1) {
+        // A single context prefilling alone may borrow the whole process team: half a box of
+        // threads is what caps per-request prefill. Concurrent prefills keep their own halves.
+        bool wide = false;
+        const int n_thr_team = (int) params_base.n_threads;
+        const int ith_total  = n_thr_team * n_ctx_split;
+        if (runs.size() == 1 && n_ctx_split > 1 && runs[0].n >= 512) {
+            int ci = 0;
+            for (size_t k = 0; k < ctxs.size(); ++k) {
+                if (ctxs[k] == runs[0].c) { ci = (int) k; break; }
+            }
+            llama_set_prefill_team(runs[0].c, 0, ith_total, (uint32_t) params_base.n_threads_batch * n_ctx_split);
+            ret = server_decode(runs[0].c, make_view(runs[0]));
+            llama_set_prefill_team(runs[0].c, ci * n_thr_team, ith_total, (uint32_t) params_base.n_threads_batch);
+            wide = true;
+        }
+        if (wide) {
+            // done
+        } else if (runs.size() == 1) {
             ret = server_decode(runs[0].c, make_view(runs[0]));
         } else {
             std::vector<int> rets(runs.size(), 0);

@@ -14335,6 +14335,17 @@ void llama_set_ith_range(struct llama_context * ctx, uint32_t ith_offset, uint32
     ctx->cparams.ith_total  = ith_total;
 }
 
+// llama_set_prefill_team: temporarily let this context's prefill batches run on a wider team.
+// The range has to be widened together with the batch thread count, because the CPU backend sizes
+// its worker pool from n_threads_batch while the NUMA placement maps ith -> node out of ith_total.
+// A single node's context prefilling alone owns half the box otherwise.
+void llama_set_prefill_team(struct llama_context * ctx, uint32_t ith_offset, uint32_t ith_total,
+                            uint32_t n_threads_batch) {
+    ctx->cparams.ith_offset        = ith_offset;
+    ctx->cparams.ith_total         = ith_total;
+    ctx->cparams.n_threads_batch   = n_threads_batch;
+}
+
 // llama_set_numa_slot_split: split mixed-socket decode batches into one pass per NUMA node.
 // Slots [0, n_seq_max/2) decode on node 0 (ith range [0, n_threads/2)) and the rest on node 1.
 // Prefill batches keep the full team. 0 disables the split.

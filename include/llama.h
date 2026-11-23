@@ -1219,6 +1219,11 @@ extern "C" {
     // to keep two contexts on two NUMA nodes. (0, 0) restores the whole team.
     LLAMA_API void llama_set_ith_range(struct llama_context * ctx, uint32_t ith_offset, uint32_t ith_total);
 
+    // llama_set_prefill_team: widen a context's prefill team (ith range plus batch thread count).
+    // Used when one context prefills alone and may borrow the whole process team.
+    LLAMA_API void llama_set_prefill_team(struct llama_context * ctx, uint32_t ith_offset, uint32_t ith_total,
+                                          uint32_t n_threads_batch);
+
     LLAMA_API void llama_get_ith_range(const struct llama_context * ctx, uint32_t * ith_offset, uint32_t * ith_total);
 
     // Split mixed-socket decode batches into one pass per NUMA node: slots [0, n_seq_max/2)
