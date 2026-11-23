@@ -1,3 +1,4 @@
+#include <map>
 #include <thread>
 
 #include "server-context.h"
@@ -5248,10 +5249,23 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             while (e < n_tokens && ctx_for_token(e) == c) {
                 ++e;
             }
+            // Mixed shapes are not safe either: a block that carries one sequence's prefill
+            // (many tokens) next to another sequence's single decode token makes the graph
+            // builder shape the batch as if it were all prefill, and the hybrid residual path
+            // aborts on it. Only a pure decode block (every sequence exactly one token) may stay
+            // whole; anything else is split per sequence.
             bool repeats = false;
-            for (int32_t a = t; a < e && !repeats; ++a) {
-                for (int32_t b = a + 1; b < e; ++b) {
-                    if (batch.seq_id[a][0] == batch.seq_id[b][0]) { repeats = true; break; }
+            {
+                std::map<llama_seq_id, int32_t> per_seq;
+                for (int32_t a = t; a < e; ++a) {
+                    per_seq[batch.seq_id[a][0]]++;
+                }
+                if (per_seq.size() > 1) {
+                    for (const auto & kv : per_seq) {
+                        if (kv.second > 1) { repeats = true; break; }
+                    }
+                } else {
+                    repeats = false;
                 }
             }
             if (!repeats) {
@@ -5313,11 +5327,23 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         } else if (runs.size() == 1) {
             ret = server_decode(runs[0].c, make_view(runs[0]));
         } else {
+            // One thread per context, sequential inside a context. Two runs that share a context
+            // must not decode at the same time: they share the graph, the compute buffers and the
+            // KV cache, so overlapping llama_decode calls corrupt each other. Runs on different
+            // contexts (the per-NUMA split) can go in parallel.
+            std::map<llama_context *, std::vector<size_t>> by_ctx;
+            for (size_t k = 0; k < runs.size(); ++k) {
+                by_ctx[runs[k].c].push_back(k);
+            }
             std::vector<int> rets(runs.size(), 0);
             std::vector<std::thread> th;
-            th.reserve(runs.size());
-            for (size_t k = 0; k < runs.size(); ++k) {
-                th.emplace_back([&, k]() { rets[k] = server_decode(runs[k].c, make_view(runs[k])); });
+            th.reserve(by_ctx.size());
+            for (const auto & kv : by_ctx) {
+                th.emplace_back([&, ks = kv.second]() {
+                    for (size_t k : ks) {
+                        rets[k] = server_decode(runs[k].c, make_view(runs[k]));
+                    }
+                });
             }
             for (auto & t : th) {
                 t.join();

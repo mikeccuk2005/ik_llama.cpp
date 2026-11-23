@@ -644,6 +644,10 @@ ggml_tensor * delta_net::build_layer_attn_linear_core(ggml_context * ctx0, ggml_
 ggml_tensor * delta_net::build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
         ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb,
         bool external_residual, ggml_unary_op gate_op) const {
+    if (lctx.inp_s_seq_qnext == nullptr) {
+        fprintf(stderr, "DBG delta-net: qnext NULL il=%d all_same_seq=%d mtp_op=%d\n",
+                il, (int) all_same_seq, (int) lctx.cparams.mtp_op_type);
+    }
     GGML_ASSERT(lctx.inp_s_seq_qnext != nullptr);
 
     auto & model = lctx.model;

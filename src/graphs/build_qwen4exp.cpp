@@ -556,6 +556,11 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
     const int n_layer_begin = is_mtp ? n_layer - hparams.nextn_predict_layers : 0;
     const int n_layer_end   = is_mtp ? n_layer : n_layer - hparams.nextn_predict_layers;
 
+    if (getenv("QWEN4_DBG")) {
+        fprintf(stderr, "DBG build_qwen4exp: is_mtp=%d n_tokens=%d qnext_before=%p mtp_op=%d\n",
+                (int) is_mtp, (int) n_tokens, (void *) lctx.inp_s_seq_qnext,
+                (int) lctx.cparams.mtp_op_type);
+    }
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = (is_mtp || n_tokens > 1) ? build_inp_out_ids() : nullptr;
     ggml_tensor * KQ_mask = build_inp_KQ_mask();
