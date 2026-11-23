@@ -5748,9 +5748,23 @@ void ggml_numa_bind(void * ptr, size_t size, int node) {
 // ggml_graph_compute before workers start. Allocates the node-local counter lines once.
 // Activates only when NUMA mirroring is on (threads are pinned per node, matching the block split
 // used by ggml_numa_node_for_thread); otherwise leaves the flat barrier in place.
-static void ggml_numa_barrier_setup(int n_threads) {
+// ggml_numa_barrier_setup: arm the hierarchical barrier for a team that actually spans sockets.
+// A team confined to one socket (a per-node context under --numa-ctx-split) must not touch the
+// global barrier state: its node counts would be wrong and two teams running at once would
+// share global_arrive/global_release.
+static void ggml_numa_barrier_setup(int n_threads, int ith_offset, int ith_total) {
     if (!ggml_numa_mirror_active() || g_state.numa.n_nodes < 2 || n_threads <= 1) {
         g_numa_barrier.active = 0;
+        return;
+    }
+
+    if (ith_total <= 0) {
+        ith_total = n_threads;
+    }
+    const int node_first = ggml_numa_node_for_thread(ith_offset, ith_total);
+    const int node_last  = ggml_numa_node_for_thread(ith_offset + n_threads - 1, ith_total);
+    if (node_first == node_last) {
+        g_numa_barrier.active = 0; // single-socket team: flat barrier inside the team
         return;
     }
     const int n = (int) g_state.numa.n_nodes;
@@ -31044,7 +31058,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 state_shared.n_threads = n_threads;
                 // configure the NUMA-aware barrier for this thread count (single-threaded here;
                 // the implicit barrier ending this 'single' publishes it to all workers)
-                ggml_numa_barrier_setup(n_threads);
+                ggml_numa_barrier_setup(n_threads, ith_offset, ith_total);
             }
 
             struct ggml_compute_state worker = {
@@ -31077,7 +31091,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         };
     }
 
-    ggml_numa_barrier_setup(n_threads); // configure NUMA-aware barrier before workers start
+    ggml_numa_barrier_setup(n_threads, ith_offset, ith_total); // configure NUMA-aware barrier before workers start
 
     // create thread pool
     for (int j = 1; j < n_threads; ++j) {

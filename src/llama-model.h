@@ -681,6 +681,11 @@ struct llama_model {
     // Set by llm_apply_khad_pretransform once H is folded into wv_b/kv_b_pp.
     bool khad_pretransformed = false;
 
+    // Set once -muge data has been interleaved into ffn_up_gate_exps. The repack is not
+    // idempotent: afterwards ffn_up_exps/ffn_gate_exps are views into the merged tensor, so a
+    // second run re-interleaves interleaved data and every context on the model decodes garbage.
+    mutable bool up_gate_repacked = false;
+
     ~llama_model();
 
     size_t max_nodes(int n_tokens) const {

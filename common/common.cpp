@@ -2644,6 +2644,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.numa_nonexp_node = std::atoi(argv[i]);    // -1 = alternate layers across nodes
         return true;
     }
+    if (arg == "--numa-ctx-split") {
+        CHECK_ARG
+        params.numa_ctx_split = std::max(1, std::atoi(argv[i]));
+        return true;
+    }
     if (arg == "--numa-slot-split") {
         params.numa_slot_split = 1;
         return true;
@@ -3741,6 +3746,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "  weights, kv, all, none (default: all). implies --numa mirror" });
     options.push_back({ "*",           "       --numa-nonexp-node N",   "with --numa mirror-nonexp: NUMA node holding the single shared copy of\n"
                                                                         "expert tensors (default -1: alternate layers across nodes)" });
+    options.push_back({ "*",           "       --numa-ctx-split N","one llama_context per NUMA node, decoded concurrently\\n"
+                                                                        " (slots are block-assigned, -c is the total across contexts)" });
     options.push_back({ "*",           "       --numa-slot-split","decode each NUMA node's slots on that node's half of the thread team\\n"
                                                                         " (slots >= n_seq_max/2 decode on node 1); prefill keeps the whole team" });
     options.push_back({ "*",           "       --numa-expert-cache-mb N","with --numa mirror-nonexp: per-node budget (MB) for copies of the expert\n"

@@ -51,6 +51,7 @@ struct server_slot {
     int32_t n_kept_prompt = 0;
 
     int32_t i_batch = -1;
+    int32_t i_batch_local = -1; // index within this slot's context decode run
     int32_t n_predict = -1; // TODO: disambiguate from params.n_predict
     int32_t prompt_batch_i0 = -1;
     int32_t prompt_batch_i1 = -1;
@@ -247,6 +248,8 @@ struct server_metrics {
 struct server_context {
     llama_model* model = nullptr;
     llama_context* ctx = nullptr;
+    std::vector<llama_context*> ctxs; // one per NUMA node when --numa-ctx-split > 1; ctxs[0] == ctx
+    int n_ctx_split = 1;
     std::vector<llama_lora_adapter_container> lora_adapters;
     std::vector<control_vector_container> control_vectors;
 

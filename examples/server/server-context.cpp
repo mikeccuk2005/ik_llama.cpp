@@ -1,3 +1,5 @@
+#include <thread>
+
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -247,6 +249,25 @@ server_context::~server_context() {
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
 
+    n_ctx_split = std::max(1, params_base.numa_ctx_split);
+    const uint32_t n_ctx_total = params_base.n_ctx;
+    if (n_ctx_split > 1) {
+        if (params_base.n_parallel % n_ctx_split != 0) {
+            LOG_ERROR("--numa-ctx-split must divide --parallel", {
+                {"n_parallel", params_base.n_parallel}, {"n_ctx_split", n_ctx_split} });
+            return false;
+        }
+        // every context holds an even share of the context, and -c keeps meaning "total"
+        params_base.n_ctx = std::max<uint32_t>(1, n_ctx_total / n_ctx_split);
+        if (params_base.do_checkpoint) {
+            // checkpoints are captured through the context object the slot happens to hold, and
+            // the restore paths assume one cache; keep them out of the split until they are
+            // context-aware
+            SRV_WRN("%s", "--numa-ctx-split disables context checkpoints\n");
+            params_base.do_checkpoint = false;
+        }
+    }
+
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
 
     model = llama_init.model;
@@ -265,7 +286,47 @@ bool server_context::load_model(const gpt_params& params_) {
         return false;
     }
 
-    n_ctx = llama_n_ctx(ctx);
+    n_ctx = llama_n_ctx(ctx) * n_ctx_split; // total across all contexts
+
+    ctxs.clear();
+    ctxs.push_back(ctx);
+    if (n_ctx_split > 1) {
+        const int32_t n_thr = std::max(1, params_base.n_threads);
+        const int32_t ith_total = n_thr * n_ctx_split;
+
+        llama_set_ith_range(ctx, 0, ith_total);
+
+        for (int i = 1; i < n_ctx_split; ++i) {
+            llama_context_params cparams = common_context_params_to_llama(params_base);
+            cparams.n_ctx           = llama_n_ctx(ctx);
+            cparams.n_seq_max       = params_base.n_parallel; // keep seq ids global
+            cparams.n_threads       = n_thr;
+            cparams.n_threads_batch = params_base.n_threads_batch;
+
+            llama_context * c = llama_init_from_model(model, cparams);
+            if (c == nullptr) {
+                LOG_ERROR("failed to create context for NUMA node", { {"node", i} });
+                return false;
+            }
+            llama_set_ith_range(c, i * n_thr, ith_total);
+            ctxs.push_back(c);
+        }
+        if (!params_base.system_prompt.empty()) {
+            SRV_WRN("%s", "--numa-ctx-split ignores the shared system-prompt cache: KV copies cannot "
+                          "cross contexts, the prompt is prefilled per request instead\n");
+            params_base.system_prompt.clear();
+        }
+        SRV_INF("%s", "per-NUMA-node contexts created (each decodes its own slots)\n");
+        for (int i = 0; i < n_ctx_split; ++i) {
+            LOG_INFO("NUMA context", {
+                {"node",     i},
+                {"n_ctx",    llama_n_ctx(ctxs[i])},
+                {"n_seq_max", llama_n_seq_max(ctxs[i])},
+                {"ith_from", i * n_thr},
+                {"ith_to",   i * n_thr + n_thr - 1},
+            });
+        }
+    }
 
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
@@ -361,7 +422,13 @@ void server_context::init() {
         server_slot slot;
 
         slot.id = i;
-        slot.ctx = ctx;
+        if (n_ctx_split > 1) {
+            const int per = params_base.n_parallel / n_ctx_split;
+            const int ci  = std::min(n_ctx_split - 1, i / std::max(1, per));
+            slot.ctx = ctxs[ci];
+        } else {
+            slot.ctx = ctx;
+        }
         slot.n_ctx = n_ctx_slot;
         slot.n_predict = params_base.n_predict;
         slot.mctx = mctx;
@@ -1379,11 +1446,11 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
 
     if (slot.sparams.penalty_last_n == -1) {
         // note: should be the slot's context and not the full context, but it's ok
-        slot.sparams.penalty_last_n = llama_n_ctx(ctx);
+        slot.sparams.penalty_last_n = llama_n_ctx(slot.ctx);
     }
 
     if (slot.sparams.dry_penalty_last_n == -1) {
-        slot.sparams.dry_penalty_last_n = llama_n_ctx(ctx);
+        slot.sparams.dry_penalty_last_n = llama_n_ctx(slot.ctx);
 
     }
     if (slot.sparams.dry_base < 1.0f)
@@ -2127,8 +2194,10 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
 void server_context::kv_cache_clear() {
     LOG_VERBOSE("clearing KV cache", {});
 
-    // clear the entire KV cache
-    llama_kv_cache_clear(ctx);
+    // clear the entire KV cache (every per-node context when the split is on)
+    for (auto * c : (ctxs.empty() ? std::vector<llama_context *>{ctx} : ctxs)) {
+        llama_kv_cache_clear(c);
+    }
     for (auto & slot : slots) {
         if (slot.spec == nullptr) {
             continue;
@@ -2185,9 +2254,9 @@ void server_context::system_prompt_update() {
             }
         }
 
-        // assign the system KV cache to all parallel sequences
-        for (int32_t i = 1; i <= params_base.n_parallel; ++i) {
-            llama_kv_cache_seq_cp(ctx, 0, i, -1, -1);
+        // assign the system KV cache to all parallel sequences, in each context
+        for (auto & slot : slots) {
+            llama_kv_cache_seq_cp(slot.ctx, 0, slot.id, -1, -1);
         }
     }
 
@@ -3212,7 +3281,7 @@ void server_context::process_single_task(server_task&& task) {
         create_checkpoint(*slot);
         size_t saved = save_checkpoints_to_file(filepath + ".checkpoints", slot->server_cached_prompt.checkpoints);
 
-        const size_t nwrite = llama_state_seq_save_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), token_count);
+        const size_t nwrite = llama_state_seq_save_file(slot->ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), token_count);
 
         const int64_t t_end = ggml_time_us();
         const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -3252,7 +3321,7 @@ void server_context::process_single_task(server_task&& task) {
 
         slot->cache_tokens.resize(slot->n_ctx);
         size_t token_count = 0;
-        size_t nread = llama_state_seq_load_file(ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), slot->cache_tokens.size(), &token_count);
+        size_t nread = llama_state_seq_load_file(slot->ctx, filepath.c_str(), slot->id, slot->cache_tokens.data(), slot->cache_tokens.size(), &token_count);
         if (nread == 0) {
             slot->cache_tokens.resize(0);
             send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
@@ -3294,7 +3363,7 @@ void server_context::process_single_task(server_task&& task) {
         }
         // Erase token cache
         const size_t n_erased = slot->cache_tokens.size();
-        llama_kv_cache_seq_rm(ctx, slot->id, -1, -1);
+        llama_kv_cache_seq_rm(slot->ctx, slot->id, -1, -1);
         slot->cache_tokens.keep_first(0);
         //slot->cache_tokens.clear();
         clear_checkpoints_and_spill(slot->server_cached_prompt.checkpoints);
@@ -3551,8 +3620,8 @@ void server_context::discard_n_kv_and_cache_tokens(llama_context* ctx, server_sl
     auto kv_past = slot.cache_tokens.pos_next(slot.n_past);
     int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
     const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
-    llama_kv_cache_seq_rm(ctx, slot.id, slot.cache_tokens.pos_next(kv_keep), slot.cache_tokens.pos_next(kv_keep + kv_discard));
-    llama_kv_cache_seq_add(ctx, slot.id, kv_keep + kv_discard, kv_past, -kv_discard);
+    llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.cache_tokens.pos_next(kv_keep), slot.cache_tokens.pos_next(kv_keep + kv_discard));
+    llama_kv_cache_seq_add(slot.ctx, slot.id, kv_keep + kv_discard, kv_past, -kv_discard);
     if (slot.spec) {
         common_speculative_context_shift(slot.spec, slot.id, kv_keep, kv_discard, kv_past);
     }
@@ -3942,7 +4011,7 @@ static bool has_restorable_checkpoint(const server_slot & slot) {
 void server_context::apply_checkpoint(server_slot & slot) {
     llama_pos pos_next = slot.cache_tokens.pos_next(slot.n_past);
     const bool has_new_tokens = (slot.n_past < slot.prompt_tokens.size());
-    const auto pos_min_thold = std::max(0, pos_next - (has_new_tokens ? 0 : 1) - llama_kv_cache_n_swa(ctx));
+    const auto pos_min_thold = std::max(0, pos_next - (has_new_tokens ? 0 : 1) - llama_kv_cache_n_swa(slot.ctx));
     const bool is_openpangu = llama_model_is_openpangu(model);
     if (slot.n_past > 0 && slot.n_past < slot.cache_tokens.n_tokens()) {
         int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
@@ -3994,7 +4063,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 const bool rewound = !is_openpangu ||
                     llama_kv_cache_seq_rm(slot.ctx, slot.id, it->pos_max + 1, -1);
                 const size_t n = rewound
-                    ? llama_state_seq_set_data(ctx, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
+                    ? llama_state_seq_set_data(slot.ctx, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
                     : 0;
 
                 if (!rewound) {
@@ -4461,7 +4530,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     p0 = (int)system_tokens.size();
                     if (p0 != 0) {
                         // copy over the system prompt when there is one
-                        llama_kv_cache_seq_cp(ctx, 0, slot.id, -1, -1);
+                        llama_kv_cache_seq_cp(slot.ctx, 0, slot.id, -1, -1);
                     }
 
                     // there is no common part left (except for the system prompt)
@@ -4631,9 +4700,9 @@ void server_context::extend_context(const int32_t n_tokens) {
                 LOG_TEE("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n, (slot.ga_i + ib * bd) / slot.ga_n, (slot.ga_i + ib * bd + slot.ga_w) / slot.ga_n);
                 LOG_TEE("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd, slot.ga_i + ib * bd + slot.ga_w + dd, slot.n_past_se + ib * bd + dd);
 
-                llama_kv_cache_seq_add(ctx, slot.id, slot.ga_i, slot.n_past_se, ib * bd);
-                llama_kv_cache_seq_div(ctx, slot.id, slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n);
-                llama_kv_cache_seq_add(ctx, slot.id, slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd);
+                llama_kv_cache_seq_add(slot.ctx, slot.id, slot.ga_i, slot.n_past_se, ib * bd);
+                llama_kv_cache_seq_div(slot.ctx, slot.id, slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n);
+                llama_kv_cache_seq_add(slot.ctx, slot.id, slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd);
 
                 slot.n_past_se -= bd;
 
@@ -5130,6 +5199,49 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         bool finish_prompt_warmup_batch = false;
         extend_context(n_tokens);
 
+        // Per-context decode: tokens are grouped by the context that owns their slot, and every
+        // group is decoded on its own context, with that context's own KV cache and thread range.
+        // Slots are block-assigned to contexts, so each group is one contiguous run of the batch.
+        struct decode_run {
+            int32_t i0 = 0;   // first token of the run, relative to i
+            int32_t n  = 0;   // tokens in the run
+            llama_context * c = nullptr;
+        };
+
+        auto ctx_for_token = [&](int32_t t) -> llama_context * {
+            if (batch.n_seq_id != nullptr && batch.seq_id != nullptr && batch.n_seq_id[t] == 1) {
+                const int32_t sid = batch.seq_id[t][0];
+                if (sid >= 0 && sid < (int32_t) slots.size() && slots[sid].ctx != nullptr) {
+                    return slots[sid].ctx;
+                }
+            }
+            return ctx;
+        };
+
+        std::vector<decode_run> runs;
+        for (int32_t t = 0; t < n_tokens; ) {
+            llama_context * c = ctx_for_token(t);
+            int32_t e = t + 1;
+            while (e < n_tokens && ctx_for_token(e) == c) {
+                ++e;
+            }
+            runs.push_back({ t, e - t, c });
+            t = e;
+        }
+
+        auto make_view = [&](const decode_run & r) -> llama_batch {
+            llama_batch v = {};
+            v.n_tokens = r.n;
+            v.token    = batch.token    + i + r.i0;
+            v.pos      = batch.pos      + i + r.i0;
+            v.n_seq_id = batch.n_seq_id + i + r.i0;
+            v.seq_id   = batch.seq_id   + i + r.i0;
+            v.logits   = batch.logits   + i + r.i0;
+            return v;
+        };
+
+        // whole-chunk view for the paths that still consume one batch (MTP warmup, embeddings);
+        // the decode itself uses the per-context runs above
         llama_batch batch_view = {
             n_tokens,
             batch.token + i,
@@ -5139,6 +5251,35 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             batch.seq_id + i,
             batch.logits + i,
             0, 0, 0, // unused
+        };
+
+        int ret = 0;
+        if (runs.size() == 1) {
+            ret = server_decode(runs[0].c, make_view(runs[0]));
+        } else {
+            std::vector<int> rets(runs.size(), 0);
+            std::vector<std::thread> th;
+            th.reserve(runs.size());
+            for (size_t k = 0; k < runs.size(); ++k) {
+                th.emplace_back([&, k]() { rets[k] = server_decode(runs[k].c, make_view(runs[k])); });
+            }
+            for (auto & t : th) {
+                t.join();
+            }
+            for (int r : rets) {
+                if (r != 0) { ret = r; break; }
+            }
+        }
+
+        // token index -> index within its context's decode run (that is what logits lookups take)
+        auto to_local = [&](int32_t tok) -> int32_t {
+            const int32_t rel = tok - i;
+            for (const auto & r : runs) {
+                if (rel >= r.i0 && rel < r.i0 + r.n) {
+                    return rel - r.i0;
+                }
+            }
+            return rel;
         };
 
         // token index -> output-row index (differs once non-output rows are pruned)
@@ -5153,7 +5294,12 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             return n;
         };
 
-        const int ret = server_decode(ctx, batch_view);
+        for (auto & slot : slots) {
+            slot.i_batch_local = -1;
+            if (slot.i_batch >= i && slot.i_batch < i + n_tokens) {
+                slot.i_batch_local = to_local(slot.i_batch);
+            }
+        }
 
         // Copy the drafted rows out before anything else decodes: the mapping they were
         // sampled from is about to be overwritten by the next llama_decode().
@@ -5168,7 +5314,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 for (size_t k = 0; k < slot.i_batch_dft.size(); ++k) {
                     const float * row = nullptr;
                     try {
-                        row = llama_get_logits_ith(ctx, slot.i_batch_dft[k]);
+                        row = llama_get_logits_ith(slot.ctx, to_local(slot.i_batch_dft[k]));
                     } catch (const std::exception &) {
                     }
                     if (row == nullptr) {
@@ -5325,7 +5471,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             completion_token_output result;
             // logits/sampling use a token index; hidden capture uses an output-row index
-            const int tok_idx = slot.i_batch - i;
+            const int tok_idx = slot.i_batch_local >= 0 ? slot.i_batch_local : slot.i_batch - i;
 
             if (slot.uses_mtp() && slot.n_decoded == 0) {
                 const int out_idx = batch_out_index(slot.i_batch);
@@ -5342,8 +5488,8 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
             llama_token id;
             try {
-                id = common_sampler_sample(slot.ctx_sampling, ctx, tok_idx);
-                common_sampler_accept(slot.ctx_sampling, ctx, id, true);
+                id = common_sampler_sample(slot.ctx_sampling, slot.ctx, tok_idx);
+                common_sampler_accept(slot.ctx_sampling, slot.ctx, id, true);
             } catch (const std::exception & e) {
                 LOG_ERROR("sampling failed, releasing slot", {
                     {"id_slot", slot.id},
@@ -5490,8 +5636,10 @@ void server_context::update_slots() {
         {"n_tokens", batch.n_tokens},
         });
 
-    // make sure we're in the right embedding mode
-    llama_set_embeddings(ctx, batch_type == 1);
+    // make sure we're in the right embedding mode (every context)
+    for (auto * c : (ctxs.empty() ? std::vector<llama_context *>{ctx} : ctxs)) {
+        llama_set_embeddings(c, batch_type == 1);
+    }
 
     if (common_speculative_needs_checkpoint(model)) {
         const int ckpt_mode = params_base.speculative.spec_ckpt_mode;

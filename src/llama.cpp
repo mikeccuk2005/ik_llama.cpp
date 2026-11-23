@@ -9925,6 +9925,9 @@ static void llama_repack_up_gate_exps(llama_context & lctx) {
         return;
     }
     auto & model = lctx.model;
+    if (model.up_gate_repacked) {
+        return; // already interleaved by an earlier context on this model
+    }
     bool needs_repack = false;
     for (auto & l : model.layers) {
         if (l.ffn_up_gate_exps && l.ffn_up_exps && l.ffn_gate_exps &&
@@ -10001,6 +10004,7 @@ static void llama_repack_up_gate_exps(llama_context & lctx) {
             }
         }
     }
+    model.up_gate_repacked = true;
 }
 
 struct llama_context * llama_init_from_model(
