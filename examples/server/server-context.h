@@ -78,6 +78,9 @@ struct server_slot {
     // cached indices go stale as soon as another slot decodes. Hold the bytes instead;
     // they stay valid until the slot is handed new work.
     std::vector<float> logits_cache;
+    // true when logits_cache holds this slot's own row (captured because its context decoded
+    // another run after it), false when it holds drafted verification rows
+    bool logits_cache_is_main = false;
 
     std::vector<completion_token_output> generated_token_probs;
 

@@ -5260,13 +5260,16 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 for (int32_t a = t; a < e; ++a) {
                     per_seq[batch.seq_id[a][0]]++;
                 }
-                if (per_seq.size() > 1) {
-                    for (const auto & kv : per_seq) {
-                        if (kv.second > 1) { repeats = true; break; }
-                    }
-                } else {
-                    repeats = false;
+                bool has_long = false;
+                bool has_single = false;
+                for (const auto & kv : per_seq) {
+                    (kv.second > 1 ? has_long : has_single) = true;
                 }
+                // Only the prefill-next-to-decode mix is unsafe. A block where every sequence
+                // carries the same multi-token shape (a parallel speculative verify) is a shape the
+                // builder already handles, and splitting it would leave only the last run's logits
+                // in the context.
+                repeats = per_seq.size() > 1 && has_long && has_single;
             }
             if (!repeats) {
                 runs.push_back({ t, e - t, c });
@@ -5340,8 +5343,47 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             th.reserve(by_ctx.size());
             for (const auto & kv : by_ctx) {
                 th.emplace_back([&, ks = kv.second]() {
+                    const bool more_runs = ks.size() > 1;
                     for (size_t k : ks) {
                         rets[k] = server_decode(runs[k].c, make_view(runs[k]));
+                        if (rets[k] != 0 || !more_runs) {
+                            continue;
+                        }
+                        // This context decodes again below, and a context keeps only the rows of
+                        // its last decode. Keep the row this slot is going to sample from.
+                        const int32_t n_voc_run = llama_n_vocab(llama_get_model(runs[k].c));
+                        for (auto & slot : slots) {
+                            if (slot.ctx != runs[k].c || slot.i_batch < 0) {
+                                continue;
+                            }
+                            if (slot.i_batch < i + runs[k].i0 || slot.i_batch >= i + runs[k].i0 + runs[k].n) {
+                                continue;
+                            }
+                            // A sequence only exposes logits at its last token in the run; a chunk in
+                            // the middle of a long prefill exposes none at all. Asking for any other
+                            // position floods the log and returns nothing.
+                            const int32_t local = slot.i_batch - (i + runs[k].i0);
+                            bool last_of_seq = true;
+                            for (int32_t a2 = local + 1; a2 < runs[k].n; ++a2) {
+                                if (batch.seq_id[i + runs[k].i0 + a2][0] == batch.seq_id[slot.i_batch][0]) {
+                                    last_of_seq = false;
+                                    break;
+                                }
+                            }
+                            if (!last_of_seq) {
+                                continue;
+                            }
+                            const bool asked = batch.logits != nullptr && batch.logits[slot.i_batch] != 0;
+                            if (!asked) {
+                                continue;
+                            }
+                            const float * row = llama_get_logits_ith(slot.ctx, local);
+                            if (row == nullptr) {
+                                continue;
+                            }
+                            slot.logits_cache.assign(row, row + n_voc_run);
+                            slot.logits_cache_is_main = true;
+                        }
                     }
                 });
             }
@@ -5351,6 +5393,15 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             for (int r : rets) {
                 if (r != 0) { ret = r; break; }
             }
+        }
+
+        const bool split_dbg = getenv("SPLIT_DBG") != nullptr;
+        if (split_dbg) {
+            fprintf(stderr, "DBG batch: n_tokens=%d i=%d n_runs=%zu", n_tokens, i, runs.size());
+            for (const auto & r : runs) {
+                fprintf(stderr, " [i0=%d n=%d ctx=%p]", r.i0, r.n, (void *) r.c);
+            }
+            fprintf(stderr, "\n");
         }
 
         // token index -> index within its context's decode run (that is what logits lookups take)
@@ -5378,6 +5429,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
         for (auto & slot : slots) {
             slot.i_batch_local = -1;
+            slot.logits_cache_is_main = false;
             if (slot.i_batch >= i && slot.i_batch < i + n_tokens) {
                 slot.i_batch_local = to_local(slot.i_batch);
             }
@@ -5554,6 +5606,19 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             completion_token_output result;
             // logits/sampling use a token index; hidden capture uses an output-row index
             const int tok_idx = slot.i_batch_local >= 0 ? slot.i_batch_local : slot.i_batch - i;
+            if (getenv("SPLIT_DBG")) {
+                fprintf(stderr, "DBG slot %d: i_batch=%d local=%d tok_idx=%d dft=%zu captured=%d cache=%zu\n",
+                        slot.id, slot.i_batch, slot.i_batch_local, tok_idx, slot.i_batch_dft.size(),
+                        (int) slot.logits_cache_is_main, slot.logits_cache.size());
+            }
+
+            // the slot's context decoded more runs after this one, so its logits rows belong to a
+            // later run: sample from the row captured right after this slot's own decode
+            if (slot.logits_cache_is_main && !slot.logits_cache.empty()) {
+                slot.ctx_sampling->external_logits      = slot.logits_cache.data();
+                slot.ctx_sampling->external_logits_base = tok_idx;
+                slot.ctx_sampling->external_logits_size = slot.logits_cache.size() * sizeof(float);
+            }
 
             if (slot.uses_mtp() && slot.n_decoded == 0) {
                 const int out_idx = batch_out_index(slot.i_batch);
@@ -5572,6 +5637,8 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             try {
                 id = common_sampler_sample(slot.ctx_sampling, slot.ctx, tok_idx);
                 common_sampler_accept(slot.ctx_sampling, slot.ctx, id, true);
+                slot.ctx_sampling->external_logits      = nullptr;
+                slot.ctx_sampling->external_logits_size = 0;
             } catch (const std::exception & e) {
                 LOG_ERROR("sampling failed, releasing slot", {
                     {"id_slot", slot.id},
