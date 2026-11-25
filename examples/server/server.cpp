@@ -1740,9 +1740,26 @@ int main(int argc, char ** argv) {
             res_err(res, format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
             return;
         }
+        std::vector<raw_buffer> images;
         if (n_images > 0) {
-            res_err(res, format_error_response("This server does not support image input for decisions", ERROR_TYPE_NOT_SUPPORTED));
-            return;
+            if (decision.mctx == nullptr) {
+                res_err(res, format_error_response("the server has no vision tower loaded, start it with --mmproj to use image input", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            const json imgs = json_value(body, "images", json::array());
+            if (imgs.size() != n_images) {
+                res_err(res, format_error_response("image parts inside \"state\" messages are not supported yet, put all data URLs in the top-level \"images\"", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            for (const auto & url : imgs) {
+                const std::string s = url.get<std::string>();
+                const size_t comma = s.find(",");
+                if (comma == std::string::npos) {
+                    res_err(res, format_error_response("image data URL is missing the base64 payload", ERROR_TYPE_INVALID_REQUEST));
+                    return;
+                }
+                images.push_back(base64_decode(s.substr(comma + 1)));
+            }
         }
         const json & state = body.at("state");
 
@@ -1755,7 +1772,7 @@ int main(int argc, char ** argv) {
                     server_task task = server_task(SERVER_TASK_TYPE_DECISION);
                     task.id = ctx_server.queue_tasks.get_new_id();
                     task.index = tasks.size();
-                    decision.fill_task(state, questions, question, variant, task);
+                    decision.fill_task(state, questions, question, variant, images, task);
                     tasks.push_back(std::move(task));
                 }
             }

@@ -7406,7 +7406,14 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 // Make sure enough space is available for outputs.
 // Returns max number of outputs for which space was reserved.
 static uint32_t llama_output_embd_width(const llama_context & lctx) {
-    return llama_mtp_state_n_embd(&lctx);
+    const uint32_t w = llama_mtp_state_n_embd(&lctx);
+    // qwen3vl inflates hparams.n_embd with deepstack vision features; embedding outputs
+    // are text-only, so their width is the pre-inflation n_embd_out
+    if (lctx.cparams.embeddings && lctx.model.hparams.n_embd_out > 0 &&
+            lctx.model.hparams.n_embd_out < (int32_t) w) {
+        return lctx.model.hparams.n_embd_out;
+    }
+    return w;
 }
 
 static bool llama_context_has_mtp_outputs(const llama_context & lctx) {
@@ -8338,8 +8345,8 @@ static int llama_decode_internal(
                             if (embd_seq_out.find(seq_id) != embd_seq_out.end()) {
                                 continue;
                             }
-                            embd_seq_out[seq_id].resize(n_embd);
-                            ggml_backend_tensor_get_async(backend_embd, embd, embd_seq_out[seq_id].data(), (n_embd*seq_id)*sizeof(float), n_embd*sizeof(float));
+                            embd_seq_out[seq_id].resize(n_embd_output);
+                            ggml_backend_tensor_get_async(backend_embd, embd, embd_seq_out[seq_id].data(), (n_embd_output*seq_id)*sizeof(float), n_embd_output*sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_UNSPECIFIED:
@@ -11278,6 +11285,10 @@ int32_t llama_model_n_embd(const struct llama_model * model) {
 
 int32_t llama_model_n_embd_inp(const llama_model* model) {
     return model->hparams.n_embd_inp();
+}
+int32_t llama_model_n_embd_out(const struct llama_model * model) {
+    // text-side embedding width; qwen3vl n_embd also counts deepstack vision features
+    return model->hparams.n_embd_out;
 }
 
 int32_t llama_n_layer(const struct llama_model * model) {

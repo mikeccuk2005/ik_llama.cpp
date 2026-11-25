@@ -313,7 +313,8 @@ std::string server_decision_context::render(
         const json & state,
         const std::vector<server_decision_question> & questions,
         const server_decision_question & question,
-        size_t variant) const {
+        size_t variant,
+        size_t n_images) const {
     // the template is given raw JSON values, it serializes the ones that are not strings
     json inp = json{
         {"id",           question.id},
@@ -341,8 +342,11 @@ std::string server_decision_context::render(
         inp = decision_sort_keys(inp);
     }
 
-    // no image input
+    // the template prints one media marker per image, mtmd_tokenize splits the prompt on them
     inp["images"] = json::array();
+    for (size_t i = 0; i < n_images; i++) {
+        inp["images"].push_back(get_media_marker());
+    }
 
     jinja::context ctx(tmpl->source());
     jinja::global_from_json(ctx, inp, false);
@@ -356,11 +360,17 @@ void server_decision_context::fill_task(
         const std::vector<server_decision_question> & questions,
         const server_decision_question & question,
         size_t variant,
+        const std::vector<raw_buffer> & images,
         server_task & task) const {
-    const std::string prompt = render(state, questions, question, variant);
+    const std::string prompt = render(state, questions, question, variant, images.size());
 
     // lev reads the ratings of a noul question at its first labels, not at the digits
     task.decision.labels.assign(labels.begin(), labels.begin() + n_outputs(question));
+    if (!images.empty()) {
+        // the prompt carries one media marker per image, mtmd builds the token/cell map
+        task.tokens = process_mtmd_prompt(mctx, prompt, images);
+        return;
+    }
     task.tokens = server_tokens(common_tokenize(vocab, prompt, false, true), false);
 }
 

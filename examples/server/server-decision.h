@@ -40,6 +40,9 @@ struct server_decision_question {
 
 struct server_decision_context {
     common_decision_type type = COMMON_DECISION_TYPE_NONE;
+    // vision tower from --mmproj, nullptr when image input is not possible
+    // the caller decodes request data URLs and hands the buffers to fill_task
+    mtmd_context * mctx = nullptr;
 
     // read the "<arch>.decision.*" metadata, type stays NONE if the model has none
     void init(const llama_model * model);
@@ -60,6 +63,7 @@ struct server_decision_context {
             const std::vector<server_decision_question> & questions,
             const server_decision_question & question,
             size_t variant,
+            const std::vector<raw_buffer> & images,
             server_task & task) const;
 
     // scores: the raw model outputs of each variant
@@ -81,7 +85,8 @@ private:
             const json & state,
             const std::vector<server_decision_question> & questions,
             const server_decision_question & question,
-            size_t variant) const;
+            size_t variant,
+            size_t n_images) const;
     json render_options(const server_decision_question & question, size_t variant) const;
     size_t n_outputs(const server_decision_question & question) const;
 

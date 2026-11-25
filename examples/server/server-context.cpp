@@ -363,6 +363,7 @@ bool server_context::load_model(const gpt_params& params_) {
             return false;
         }
         LOG_INFO("loaded multimodal model, %s\n", mmproj_path.c_str());
+        decision.mctx = mctx; // lets /v1/systemone take image input
 
         //if (params.n_cache_reuse) {
         //    params_base.n_cache_reuse = 0;
@@ -2822,7 +2823,7 @@ void server_context::send_embedding(const server_slot& slot, const llama_batch& 
     res->n_tokens = slot.prompt_tokens.size();
     res->oaicompat = slot.task->params.oaicompat;
 
-    const int n_embd = llama_model_n_embd(model);
+    const int n_embd = llama_model_n_embd_out(model);
 
     std::vector<float> embd_res(n_embd, 0.0f);
 
