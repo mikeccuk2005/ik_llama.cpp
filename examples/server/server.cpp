@@ -12,6 +12,8 @@
 #include "sampling.h"
 #include "llama.h"
 #include "llama-vocab.h"
+#include <algorithm>
+#include <cmath>
 #include <fstream>
        
 
@@ -1814,6 +1816,221 @@ int main(int argc, char ** argv) {
         });
     };
 
+    // OpenAI-style /v1/score and Cohere-style /v1/rerank for generative rerankers.
+    // each document is scored in one forward pass: the score is the softmax ratio of the
+    // two label logits (\" yes\" / \" no\" by default) read at the last prompt token,
+    // the same path as the decision endpoint. image passages need --mmproj.
+    const auto handle_score = [&ctx_server, &params](const httplib::Request & req, httplib::Response & res) {
+        const bool cohere_shape = req.path.find("rerank") != std::string::npos;
+        const json body = json::parse(req.body);
+
+        struct score_item {
+            std::string query;
+            std::string text;
+            std::string image; // raw base64, empty when the passage is text-only
+        };
+        std::vector<score_item> items;
+
+        const auto parse_doc = [cohere_shape](const json & doc, const std::string & query) {
+            score_item item;
+            item.query = query;
+            if (doc.is_string()) {
+                item.text = doc.get<std::string>();
+            } else if (doc.is_object()) {
+                item.text  = json_value(doc, "text", std::string());
+                item.image = json_value(doc, "image", std::string());
+                if (item.image.empty()) {
+                    item.image = json_value(doc, "multimodal_data", std::string());
+                }
+            } else {
+                throw std::invalid_argument("each document must be a string or an object");
+            }
+            if (!item.image.empty()) {
+                const size_t comma = item.image.find(",");
+                if (item.image.compare(0, 5, "data:") == 0) {
+                    if (comma == std::string::npos) {
+                        throw std::invalid_argument("image data URL is missing the base64 payload");
+                    }
+                    item.image = item.image.substr(comma + 1);
+                }
+            } else if (item.text.empty()) {
+                throw std::invalid_argument("each document needs \"text\" or \"image\"");
+            }
+            (void) cohere_shape;
+            return item;
+        };
+
+        try {
+            if (body.contains("documents")) {
+                const std::string query = json_value(body, "query", std::string());
+                for (const auto & doc : body.at("documents")) {
+                    items.push_back(parse_doc(doc, query));
+                }
+            } else if (body.contains("input") && body.at("input").is_object() && body.at("input").contains("documents")) {
+                const json & input = body.at("input");
+                const std::string query = json_value(input, "query", std::string());
+                for (const auto & doc : input.at("documents")) {
+                    items.push_back(parse_doc(doc, query));
+                }
+            } else if (body.contains("text_1") && body.contains("text_2")) {
+                // vLLM score API: pairwise, a scalar side broadcasts to the other
+                const auto as_list = [](const json & v) { return v.is_array() ? v : json::array({ v }); };
+                json qs = as_list(body.at("text_1"));
+                json ds = as_list(body.at("text_2"));
+                if (qs.size() == 1 && ds.size() > 1) {
+                    qs = json(ds.size(), qs.front());
+                } else if (ds.size() == 1 && qs.size() > 1) {
+                    ds = json(qs.size(), ds.front());
+                }
+                if (qs.size() != ds.size()) {
+                    throw std::invalid_argument("\"text_1\" and \"text_2\" must have the same length or one of them be a scalar");
+                }
+                for (size_t i = 0; i < qs.size(); i++) {
+                    items.push_back(parse_doc(ds[i], qs[i].get<std::string>()));
+                }
+            } else {
+                throw std::invalid_argument("expected \"query\" + \"documents\", or \"text_1\" + \"text_2\"");
+            }
+        } catch (const std::invalid_argument & e) {
+            res_err(res, format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (items.empty()) {
+            res_err(res, format_error_response("no documents to score", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        const std::string instruction = json_value(body, "instruction",
+                std::string("Judge whether the passage answers the query."));
+        std::vector<std::string> labels = { "yes", "no" };
+        if (body.contains("label")) {
+            const json & lbl = body.at("label");
+            if (!lbl.is_array() || lbl.size() != 2 || !lbl[0].is_string() || !lbl[1].is_string()) {
+                res_err(res, format_error_response("\"label\" must be an array of two strings", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            labels = { lbl[0].get<std::string>(), lbl[1].get<std::string>() };
+        }
+
+        // the labels must be single tokens, the score is read from their logits
+        const llama_vocab * vocab = llama_get_vocab(ctx_server.ctx);
+        const auto find_label = [vocab](const std::string & text, llama_token & out) {
+            const std::string spaced = " " + text;
+            llama_tokens toks = common_tokenize(vocab, spaced, false, false);
+            if (toks.size() == 1) {
+                out = toks[0];
+                return true;
+            }
+            toks = common_tokenize(vocab, text, false, false);
+            if (toks.size() == 1) {
+                out = toks[0];
+                return true;
+            }
+            return false;
+        };
+        llama_token tok_labels[2];
+        for (int i = 0; i < 2; i++) {
+            if (!find_label(labels[i], tok_labels[i])) {
+                res_err(res, format_error_response("label '" + labels[i] + "' is not a single token, pick labels the tokenizer emits whole",
+                                                   ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+        }
+
+        bool any_image = false;
+        for (const auto & item : items) {
+            any_image |= !item.image.empty();
+        }
+        if (any_image && ctx_server.mctx == nullptr) {
+            res_err(res, format_error_response("the server has no vision tower loaded, start it with --mmproj to score images",
+                                               ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        const std::string marker(get_media_marker());
+        const std::string ask = "\nDoes the passage answer the query? (" + labels[0] + "/" + labels[1] + ")\nAnswer:";
+
+        server_response_reader rd(ctx_server);
+        {
+            std::vector<server_task> tasks;
+            for (const auto & item : items) {
+                std::string prompt = "Instruct: " + instruction + "\nQuery: " + item.query + "\nPassage: ";
+                if (!item.image.empty()) {
+                    prompt += marker + "\n";
+                }
+                prompt += item.text;
+                prompt += ask;
+
+                server_task task(SERVER_TASK_TYPE_DECISION);
+                task.id    = ctx_server.queue_tasks.get_new_id();
+                task.index = tasks.size();
+                task.decision.labels = { tok_labels[0], tok_labels[1] };
+                if (!item.image.empty()) {
+                    std::vector<raw_buffer> images = { base64_decode(item.image) };
+                    task.tokens = process_mtmd_prompt(ctx_server.mctx, prompt, images);
+                } else {
+                    task.tokens = server_tokens(common_tokenize(vocab, prompt, false, true), false);
+                }
+                tasks.push_back(std::move(task));
+            }
+            rd.post_tasks(std::move(tasks));
+        }
+
+        auto all_results = rd.wait_for_all(req.is_connection_closed);
+
+        if (all_results.is_terminated) {
+            if (rd.any_task_on_slot()) llama_decode_stop();
+            return; // connection is closed
+        }
+        else if (all_results.error) {
+            res_err(res, all_results.error->to_json());
+            return;
+        }
+
+        std::vector<double> scores(items.size(), 0.0);
+        int32_t n_tokens = 0;
+        for (auto & r : all_results.results) {
+            auto * result = dynamic_cast<server_task_result_decision *>(r.get());
+            GGML_ASSERT(result != nullptr);
+            GGML_ASSERT(result->scores.size() == 2);
+            // softmax ratio of the two label logits
+            scores[result->index] = 1.0 / (1.0 + std::exp((double) result->scores[1] - result->scores[0]));
+            n_tokens += result->n_tokens;
+        }
+
+        json out;
+        out["id"]      = (cohere_shape ? "rerank-" : "score-") + random_string();
+        out["model"]   = params.model_alias;
+        out["created"] = (int64_t) std::time(nullptr);
+        out["usage"]   = { { "prompt_tokens", n_tokens }, { "total_tokens", n_tokens } };
+        if (cohere_shape) {
+            std::vector<size_t> order(items.size());
+            for (size_t i = 0; i < order.size(); i++) {
+                order[i] = i;
+            }
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return scores[a] > scores[b]; });
+            const size_t top_n = std::min<size_t>((size_t) std::max(0, json_value(body, "top_n", (int) items.size())), items.size());
+            json results = json::array();
+            for (size_t k = 0; k < top_n; k++) {
+                const size_t i = order[k];
+                results.push_back({
+                    { "index",            i },
+                    { "relevance_score",  scores[i] },
+                    { "document",         items[i].text.empty() ? json::object() : json{ { "text", items[i].text } } },
+                });
+            }
+            out["results"] = std::move(results);
+        } else {
+            json data = json::array();
+            for (size_t i = 0; i < items.size(); i++) {
+                data.push_back({ { "index", i }, { "object", "score" }, { "score", scores[i] } });
+            }
+            out["object"] = "list";
+            out["data"]   = std::move(data);
+        }
+        res_ok(res, out);
+    };
+
     const auto handle_lora_adapters_list = [&](const httplib::Request & req, httplib::Response & res) {
         json result = json::array();
         for (size_t i = 0; i < ctx_server.lora_adapters.size(); ++i) {
@@ -2372,6 +2589,11 @@ int main(int argc, char ** argv) {
     svr->Post("/embeddings",          handle_embeddings);
     svr->Post("/v1/embeddings",       handle_embeddings_oai);
     svr->Post("/v1/systemone",        handle_systemone);
+    // generative rerank/score, one-forward-pass label scoring like /v1/systemone
+    svr->Post("/v1/score",           handle_score);
+    svr->Post("/score",              handle_score);
+    svr->Post("/v1/rerank",          handle_score);
+    svr->Post("/rerank",             handle_score);
     svr->Post("/tokenize",            handle_tokenize);
     svr->Post("/detokenize",          handle_detokenize);
     svr->Post("/apply-template",      handle_apply_template);
