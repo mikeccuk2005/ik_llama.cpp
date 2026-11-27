@@ -1,183 +1,204 @@
-# NUMA-mirrored ik_llama.cpp
+# NUMA-mirrored ik_llama.cpp (fork)
 
-This is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — itself a
-performance-focused fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) (see the
-original README below) — that adds a **`--numa mirror`** mode for fast CPU inference on
-multi-socket / multi-NUMA-node servers.
+Fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (itself a performance fork of
+llama.cpp, see the original README below). This fork adds multi-socket NUMA work and a set of
+server features we run in production: Qwen3-VL vision input on the decisions/embedding/rerank
+paths, native generative-reranker endpoints, speculation with parallel slots, and the server
+correctness fixes needed to make multi-slot decoding actually work at depth.
 
-## What it does
+Everything here is merged into `main`. Numbers in this README are measured, from `LOG.md` and
+the production box; each table says which machine it came from.
 
-On a multi-socket machine, plain CPU inference scales poorly: the model weights live on one
-NUMA node, so threads running on another socket read them *remotely* over the inter-socket
-link (UPI / Infinity Fabric). That cross-socket traffic becomes the bottleneck — adding the
-second socket's cores often gives little speedup, and can even make **token generation
-slower** than using a single socket.
+## Feature overview
 
-`--numa mirror` fixes this by keeping one **full, node-local copy** of the read-mostly data
-on **every NUMA node**:
+| Feature | What you get | Perf headline |
+|---|---|---|
+| `--numa mirror` | weights + KV duplicated per NUMA node, pinned threads, hierarchical barrier | tg **1.3-1.6×** vs single socket (2-socket Xeon) |
+| `--numa mirror-nonexp` + `--numa-expert-cache-mb` | MoE: mirror dense only, share experts, cache hot peer experts per node | repairs prefill **47 → 204 t/s** on a 176B MoE |
+| `--numa-ctx-split` (per-node contexts) + full-team solo prefill | one llama_context per socket, slots pinned to a context | solo prefill **287 → 573 t/s** (2.0×), decode unchanged |
+| Speculation with `-np > 1` (`--spec-parallel`, per-sequence spec checkpoints) | ngram/MTP drafting actually runs with parallel slots | aggregate decode **14.1 → 20.4 t/s** (ngram-mod) |
+| Batched decoding at depth (mixed-batch split, one decoder thread per context, per-slot logits rows) | concurrent long-context slots no longer crash | crash (`GGML_ASSERT`) → **29-33 t/s** aggregate at 4k depth |
+| `/rerank`, `/v1/rerank`, `/score`, `/v1/score` | generative reranker behind the standard Cohere/OpenAI shapes | query + 3 docs in **1.1 s**, one forward pass per doc |
+| Qwen3-VL vision: image docs in rerank/score, `images` in `/v1/systemone`, embedding width fix | rerank/decide/embed with pictures | image decision **0.9996** confidence; embeddings 4096-dim, correct |
+| KV `q6_0` + flash attention on serving ports | ~3× cheaper KV at 2M-token contexts | KV **48 → 19.5 GiB**, quality unchanged (cos 0.9965 vs f16) |
+| AMX IQK int8 GEMM (Xeon 6, off by default) | AMX tile prefill path, gated `GGML_AMX` | +2% today; infrastructure for wider calls |
+| Server fixes: client disconnect no longer kills the batch, recurrent prefix reuse via context checkpoints, `--max-mtp-concurrent`, `--loglevel` | stability + fewer re-prefills | 3.2k-token prefix re-prefill (~5.5 s) → checkpoint restore |
 
-- **Model weights** are duplicated once per node.
-- **The KV cache** is duplicated once per node (writes are replicated to all copies; reads
-  stay local).
-- **Inference threads are pinned per node** and only ever touch their node-local copies, so
-  no model data is read across the inter-socket link.
-- A **NUMA-aware hierarchical barrier** keeps the per-op thread synchronization (otherwise a
-  major cross-socket cost during token generation) from becoming the new bottleneck.
+## `--numa mirror` — both sockets at full local bandwidth
 
-Each socket then runs at its full *local* memory bandwidth, so a multi-socket box can
-actually put all of its sockets to work. The gain is largest for **token generation**
-(memory-bandwidth bound) and more modest for prompt processing (compute bound).
+The problem: weights live on one NUMA node, so a second socket reads everything remotely over
+UPI and adding cores can make token generation *slower* than one socket. `--numa mirror` keeps a
+full node-local copy of weights and KV on every node, pins threads per node, and uses a
+NUMA-aware hierarchical barrier so synchronization does not become the new bottleneck.
+Cost: N× RAM; it implies `--no-mmap`.
 
-The trade-off is memory: mirroring uses **N× RAM** (N = number of NUMA nodes), so the model
-has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`.
+**Before/after** — Dell R740, 2× Xeon Gold 6248R (24c/node), Debian 13, `llama-bench -p 512 -n
+128 -r 3`. Before = `--numa isolate -t 24` (one socket), after = `--numa mirror -t 48`:
 
-## How to use it
+| Model | tg isolate | tg mirror | × | pp isolate | pp mirror | × |
+|---|--:|--:|--:|--:|--:|--:|
+| gemma-4-E2B (dense Q5_K_M) | 47.20 | **62.00** | 1.31 | 259.90 | 256.69 | 0.99 |
+| gemma-4-E4B (dense Q5_K_M) | 23.77 | **33.62** | 1.41 | 141.88 | **184.06** | 1.30 |
+| gemma-4-26B-A4B (MoE Q4_K_M) | 23.59 | **34.76** | 1.47 | 143.41 | **201.69** | 1.41 |
+| Qwen3.6-27B (dense Q4_K_M) | 5.27 | **8.32** | 1.58 | 33.04 | **54.22** | 1.64 |
+| Qwen3.6-35B-A3B (MoE Q5_K_M) | 24.70 | **31.56** | 1.28 | 153.68 | **193.21** | 1.26 |
+| Qwen3.5-122B-A10B (MoE Q3_K_XL) | 10.00 | **14.46** | 1.45 | 57.17 | **83.01** | 1.45 |
 
-```
-# auto-detect the NUMA nodes and mirror weights + KV across all of them
-./build/bin/llama-cli -m model.gguf --numa mirror -t <total physical cores> -p "..."
-```
+Token generation gains most (bandwidth bound); prompt processing gains 1.0-1.65×. Full raw
+output with error bars is in git history of this README and in `LOG.md`.
 
-- `--numa mirror` works in every tool that supports `--numa` (`llama-cli`, `llama-server`,
-  `llama-bench`, …).
-- `--numa-mirror <list>` selects *what* to mirror: `weights`, `kv`, `all` (default) or
-  `none` — e.g. `--numa-mirror weights` to mirror only the weights. This component selector is
-  available in the main tools (`llama-cli`, `llama-server`, …); `llama-bench` accepts
-  `--numa mirror` only and always mirrors everything (`weights` + `kv`).
-- **Requirements:** Linux, more than one NUMA node, and enough RAM to hold the model N times.
-  For best results, disable kernel auto-balancing:
-  `echo 0 | sudo tee /proc/sys/kernel/numa_balancing`.
+## `--numa mirror-nonexp` + `--numa-expert-cache-mb` — the MoE variant
 
-**`--numa mirror-nonexp`** is a memory-lean variant for MoE models. Dense tensors (attention,
-norms, embeddings) are still duplicated per node, but every `*exps*` tensor keeps a **single
-shared copy**, with all expert tensors of one layer bound to the same node so a whole layer's
-expert matmuls stay on one NUMA domain. Layers alternate between nodes by default, which splits
-the cross-socket traffic evenly; `--numa-nonexp-node N` pins every layer to one node instead.
+Mirroring a 91 GiB 176B-A10B MoE twice is wasteful and, on our Xeon 6 box (2 NUMA nodes, 128
+logical cores, 1 TB), plain mirror *lost* to a single pinned node because 128 threads of SMT
+hurt bandwidth-bound decode. `mirror-nonexp` mirrors only dense tensors and keeps one shared
+copy of the 512-expert stacks, all expert tensors of a layer on one node. Raw `mirror-nonexp`
+then collapsed prefill, because every prefill touches all experts of a layer: `--numa-expert-
+cache-mb` gives each node a budget of locally cached copies of the hottest expert tensors it
+reads from its peer (fill-only, no eviction).
 
-```bash
-# experts shared, dense weights mirrored, layers alternate node0/node1
-./build/bin/llama-server -m model.gguf --numa mirror-nonexp -t <total cores>
-# every expert layer on node 1
-./build/bin/llama-server -m model.gguf --numa mirror-nonexp --numa-nonexp-node 1
-```
+**Before/after** — ai-prod-local-llm, Qwen3.8-Flash-Next IQ4_XS (90.8 GiB), np4, MuSR 24
+samples, ngram-mod, 131k ctx:
 
-On a hybrid MoE where expert tensors are the bulk of the weights this cuts the extra RAM from
-`(N-1) x model` to roughly `(N-1) x dense-only`, at the cost of the expert reads that land on
-the other socket crossing the inter-socket link. KV mirroring is unchanged (`--numa-mirror kv`
-to turn it off).
-
-**`--numa-expert-cache-mb N`** gives every node a budget of N MB for copies of the expert tensors
-it reads most from its peer. The read path counts remote reads per tensor per node; after a short
-warm-up (256 tokens, then every 4096 tokens, at most 8 passes) each node copies its hottest
-non-local tensors into that budget. Promotion is fill-only: nothing is evicted, so a tensor is
-copied at most once per node. Budget `0` (default) disables the cache.
-
-```bash
-# experts shared, plus a 10 GB per-node cache of the hottest remote experts
-./build/bin/llama-server -m model.gguf --numa mirror-nonexp --numa-expert-cache-mb 10000
-```
-
-Watch the startup line (`NUMA expert cache: X GiB budget per node, Y expert tensors registered`)
-and the per-update line (`NUMA expert cache: update N promoted, node0 ... node1 ...`) to see what
-gets copied. Note the copy runs inside the decode call that triggers it, so the first promotion
-stalls generation for as long as the copy takes.
-- **Thread count:** token generation is memory-bandwidth bound and may peak *below* the full
-  physical-core count; it can be worth sweeping `-t` to find the sweet spot for your machine.
-
-See [`examples/main/README.md`](examples/main/README.md) for the full list of `--numa` modes.
-
-# NUMA mode benchmarks
-
-How much does **`--numa mirror`** speed up CPU inference on a dual-socket server, versus
-running on a single socket?
-
-The baseline here is `--numa isolate` (run entirely on one socket). When a model fits in a
-single NUMA node's RAM — which every model below does on this machine (384 GB/node) —
-`isolate` is the usual recommended mode, because it keeps all memory access node-local.
-(`--numa distribute` exists for models too large to fit in one node; that's not the case
-here, so it isn't included.) `mirror` keeps a full local copy of the weights and KV cache on
-*each* node, so both sockets can run while still reading only local memory.
-
-## Test setup
-
-- **Operating System:**
-  - Debian 13 "Trixie" with `numa_balancing` disabled during benchmarking
-- **Hardware:**
-  - Model: Dell PowerEdge R740
-  - CPU: 2× Intel Xeon Gold 6248R (Cascade Lake), 2 NUMA nodes (24 cores /  48 threads each)
-  - RAM: 768 GB RAM (384 GB per node) ECC DDR4 2400 MHz, all 12 memory channels populated
-- **Build:** CPU backend, `Release`, `-DGGML_NATIVE=ON -DGGML_AVX512=ON
-  -DGGML_AVX512_VNNI=ON`. (VBMI/BF16 are **not** enabled — Cascade Lake does not implement
-  `avx512_vbmi` / `avx512_bf16`.)
-- **Tool:** `llama-bench`, 3 repetitions per result (`-r 3`).
-- **Per-run flags:** `-rtr 1 -b 16 -ub 16 -p 512 -n 128` (run-time repacking on; batch and
-  micro-batch 16; `pp512` = prompt processing of 512 tokens, `tg128` = generation of 128).
-- **Modes compared** (threads set equal for `-t`/`-tb`):
-  - `isolate` — `--numa isolate -t 24 -tb 24` (one socket / 24 cores) — single-socket baseline
-  - `mirror`  — `--numa mirror  -t 48 -tb 48` (both sockets, weights + KV duplicated per node)
-
-All throughput numbers are tokens/second (higher is better).
-
-## Token generation (tg128)
-
-| Model | isolate (1 socket, 24t) | **mirror (2 sockets, 48t)** | mirror vs isolate |
+| Config | gen t/s | prefill t/s | RAM |
 |---|--:|--:|--:|
-| gemma-4-E2B (dense, Q5_K_M) | 47.20 | **62.00** | 1.31× |
-| gemma-4-E4B (dense, Q5_K_M) | 23.77 | **33.62** | 1.41× |
-| gemma-4-26B-A4B (MoE, UD-Q4_K_M) | 23.59 | **34.76** | 1.47× |
-| Qwen3.6-27B (dense, Q4_K_M) | 5.27 | **8.32** | 1.58× |
-| Qwen3.6-35B-A3B (MoE, UD-Q5_K_M) | 24.70 | **31.56** | 1.28× |
-| Qwen3.5-122B-A10B (MoE, UD-Q3_K_XL) | 10.00 | **14.46** | 1.45× |
+| `numactl` pin one node, `-t 64` (baseline) | **10.56** | 269.6 | 45 GB |
+| `--numa mirror -t 128` | 5.94 | 269.3 | 203 GB |
+| `--numa mirror-nonexp -t 128` | 4.10 | 47.1 | 140 GB |
+| `mirror-nonexp` + expert cache 10 GB/node | 6.52 | **204.4** | 160 GB |
+| champion: `mirror-nonexp --numa-mirror weights --numa-expert-cache-mb 10000 -t 64` | **8.06** | **312.9** | 160 GB |
 
-## Prompt processing (pp512)
+Honest read: on this box nothing beats a single pinned node for one big MoE (10.56 t/s at 45
+GB). The mirror family is for when the pinned baseline is no longer an option (RAM, multiple
+services, or per-node contexts below). Bigger caches did not help: 30 GB/node cached 96% of
+the peer expert set and was the *slowest* arm — the remaining cost is the cross-socket barrier
+plus SMT, not cache misses. Related finding on the same class of box: slot count beats
+placement, `np1 → np8` lifts aggregate decode **18.7 → 60.4 t/s** at 2k depth on c8id
+(IQ4_XS, `-ub 2048`), but mind the compute buffer (33 GiB at np8/ub2048, 132 GiB at ub8192).
 
-| Model | isolate (1 socket, 24t) | **mirror (2 sockets, 48t)** | mirror vs isolate |
-|---|--:|--:|--:|
-| gemma-4-E2B (dense, Q5_K_M) | 259.90 | **256.69** | 0.99× |
-| gemma-4-E4B (dense, Q5_K_M) | 141.88 | **184.06** | 1.30× |
-| gemma-4-26B-A4B (MoE, UD-Q4_K_M) | 143.41 | **201.69** | 1.41× |
-| Qwen3.6-27B (dense, Q4_K_M) | 33.04 | **54.22** | 1.64× |
-| Qwen3.6-35B-A3B (MoE, UD-Q5_K_M) | 153.68 | **193.21** | 1.26× |
-| Qwen3.5-122B-A10B (MoE, UD-Q3_K_XL) | 57.17 | **83.01** | 1.45× |
+## `--numa-ctx-split` — one context per NUMA node, full-team prefill
 
-## Takeaways
+Each socket gets its own `llama_context` (its own KV, node-local) and slots are pinned to a
+context; a prefill that runs alone borrows the whole 128-thread team and hands it back for
+decode.
 
-- **`mirror` puts the second socket to work.** Across dense and MoE models (3.4 GB → 53 GB),
-  it beats a single socket on every model for both metrics — the lone exception being prompt
-  processing on the tiny 3.4 GB gemma-E2B, where one socket already saturates and the two are
-  effectively tied.
-- **Token generation: ~1.3–1.6× `isolate`.** TG is memory-bandwidth bound; mirroring lets
-  each socket pull from its own local memory, so aggregate bandwidth (and throughput) scales
-  with the second socket instead of being capped by it.
-- **Prompt processing: ~1.0–1.65× `isolate`.** PP is more compute-bound (it amortizes weight
-  reads across the batch), so the gain is generally smaller than TG, but still a solid win on
-  the larger models where there's enough work to feed both sockets.
-- **Trade-off:** `mirror` keeps one copy of the weights + KV cache per NUMA node, i.e.
-  **N× RAM** (here 2×). It's the right mode when the model fits a node's RAM with room to
-  spare; if it doesn't, that's the case `--numa distribute` is for.
+**Before/after** — np2 split, mirror, 32 threads/socket, 3180-token prompts:
 
-### Raw `llama-bench` output
+| Metric | before (prefill capped to own socket) | after (`llama_set_prefill_team`) |
+|---|--:|--:|
+| solo prefill | 287 t/s | **573.1 t/s** (2.0×) |
+| 2 concurrent prefills | ~287 aggregate | **398.3 t/s per request** |
+| decode (1 req / 2 concurrent) | 24.4-24.6 t/s | unchanged |
 
-Each run used `-rtr 1 -b 16 -ub 16 -p 512 -n 128 -r 3` with the mode-specific `--numa` and
-`-t` settings above.
+Along the way: prefill blocks that repeat a sequence id are split per sequence (fixes
+`invalid logits id` on hybrid models), and `--numa-slot-split` + expert cache thrash was fixed
+(0.31 → 3.68 t/s), though slot-split decode still loses to one shared team on expert-read
+bound workloads and stays off by default.
 
-| Model | Mode | pp512 (t/s) | tg128 (t/s) |
+## Speculation with parallel slots (`--spec-parallel`)
+
+Upstream refuses MTP/ngram drafts with `-np > 1`. This fork adds per-sequence speculative KV
+checkpoints, shared whole-state shadows, per-slot drafted-logits copies, and the
+`--spec-parallel` opt-in, plus `--max-mtp-concurrent` to cap how many slots draft at once.
+
+**Before/after** — np2 ctx-split on the 176B MoE, coding prompts, 400 max tokens:
+
+| Spec mode | 1 request | 2 parallel | aggregate | acceptance |
+|---|--:|--:|--:|--:|
+| none (before: only mode that ran at np>1) | 24.13 | 5.91 / 8.14 | 14.1 | - |
+| ngram-mod 32/8/12 | 24.24 | 9.84 / 10.6 | **20.4** | 0.75 |
+| mtp n_max=1 | 22.06 | 5.69 / 7.92 | 13.6 | 0.43 |
+
+ngram-mod is free drafting (no extra forward pass) and wins; MTP costs a full 512-expert MoE
+forward per draft and also drags prefill from 573 to 330 t/s, so production runs ngram-mod only.
+
+## Batched decoding at depth — crash to working
+
+Two or more concurrent sequences at real context depth used to abort inside the delta-net path
+(`GGML_ASSERT(inp_s_seq_qnext)` / `RemoteDisconnected`), or sample stale logits after a
+checkpoint restore. Fixes: never mix prefill and decode in one batch block, one decoder thread
+per context (parallel across contexts), per-slot logits-row copies, checkpoint prefix guards.
+
+**Before/after** — 176B MoE, one context, 64 threads, spec on, 128 out per request:
+
+| Depth | before | after np4 (agg) | after np8 (agg) |
 |---|---|--:|--:|
-| gemma-4-E2B | isolate | 259.90 ± 5.94 | 47.20 ± 0.01 |
-| gemma-4-E2B | mirror | 256.69 ± 7.32 | 62.00 ± 0.13 |
-| gemma-4-E4B | isolate | 141.88 ± 0.86 | 23.77 ± 0.05 |
-| gemma-4-E4B | mirror | 184.06 ± 8.21 | 33.62 ± 0.21 |
-| gemma-4-26B-A4B | isolate | 143.41 ± 1.42 | 23.59 ± 0.00 |
-| gemma-4-26B-A4B | mirror | 201.69 ± 30.30 | 34.76 ± 0.68 |
-| Qwen3.6-27B | isolate | 33.04 ± 0.17 | 5.27 ± 0.00 |
-| Qwen3.6-27B | mirror | 54.22 ± 0.73 | 8.32 ± 0.02 |
-| Qwen3.6-35B-A3B | isolate | 153.68 ± 1.33 | 24.70 ± 0.01 |
-| Qwen3.6-35B-A3B | mirror | 193.21 ± 4.91 | 31.56 ± 0.08 |
-| Qwen3.5-122B-A10B | isolate | 57.17 ± 0.10 | 10.00 ± 0.00 |
-| Qwen3.5-122B-A10B | mirror | 83.01 ± 1.32 | 14.46 ± 0.01 |
+| 4k | assert/crash with ≥2 seq | 29.0 t/s | **33.4 t/s** |
+| 8k | " | 23.2 | 24.2 |
+| 16k | " | 21.1 | 24.1 |
+| 32k | " | 21.5 | 22.4 |
 
----
+Aggregate saturates ~21-24 t/s from 8k up: bandwidth-bound, so extra slots trade per-slot
+latency for the same total. This is what the serving ports (8082-8084, np8/np4) run on.
 
+## Native rerank and score endpoints
+
+`/rerank`, `/v1/rerank` (Cohere shape) and `/score`, `/v1/score` (vLLM/OpenAI shapes) for
+*generative* rerankers: one forward pass per document, score = sigmoid(final `yes` − `no`
+logit), labels configurable via `"label"`. Image documents (`{"text":"","image":"<b64>"}`) work
+when the server has an mmproj.
+
+**Before/after** (Qwen3-VL-Reranker-8B, port 8084): before, serving it meant chat completions
+and string-scraping a verdict, and a LiteLLM `mode: rerank` had no backend endpoint to hit.
+After: query + 3 docs round trip **1.1 s** through the LiteLLM gateway (scores 0.753 / 0.109 /
+0.031, order correct), prefill speed 581 t/s at 3.6k, image docs rerank correctly (red swatch
+0.46 vs blue 0.13).
+
+## Qwen3-VL vision: decisions, embeddings, and the width fix
+
+- `/v1/systemone` decisions accept `"images": ["data:image/...;base64,..."]` with a
+  `<__media__>` marker (pinnable via `LLAMA_MEDIA_MARKER`): red-swatch color choice at
+  **0.9996** confidence, same latency class as text (608 ms for 1q/3opts text).
+- qwen3vl embedding width fix: the vision tower's deepstack path widened `n_embd` to 16384
+  while `result_norm` stayed text-width, so embeddings were the wrong width/garbage. New
+  `llama_model_n_embd_out()` fixes it: 4096-dim, L2-normalized, paraphrase cosine 0.9636,
+  cross-modal (text query vs image) red 0.609 > blue 0.426. Embedding prefill 549 t/s.
+
+## KV q6_0 + flash attention on the serving ports
+
+`-fa on -ctk q6_0 -ctv q6_0` across all three production ports: at 2M-token context the KV
+went from **48 GiB (f16) to 19.5 GiB**, no measurable quality loss — embedding vectors agree
+with an f16-KV instance at cosine **0.99653** on identical text, and decision/rerank scores are
+unchanged. This is what makes np8 at 262k-per-slot fit next to two other services.
+
+## AMX int8 GEMM for IQK prefill (Xeon 6, default off)
+
+Blocked int8/AMX mul_mat path for IQK quants with VNNI weight packing, per-NUMA sub-team
+column split, vectorised activation quantise and a lock-free shadow lookup. Measured on a
+Xeon 6462C-class box at d4096: prefill 244.2 → 249.0 t/s (+2%). The AMX kernel itself is fast
+(635 GMAC/s standalone) but at 16 rows per call the whole path is join/barrier bound (wide
+calls cost 3.9 ms/thread of team join for ~1 ms of panel work), so it stays gated
+`GGML_AMX=...` off by default until callers hand it wider batches. Spin-joins measured *worse*
+than parked futex waits at 128 threads; that stays reverted.
+
+## Server fixes worth knowing
+
+- One client disconnect no longer kills the whole batch or crashes the server.
+- Recurrent/delta-net prefix reuse via context checkpoints on divergence: a second request
+  sharing a 3.2k-token prefix restores from checkpoint instead of ~5.5 s of re-prefill.
+- `--loglevel off|error|warn|info|debug` replaces the `-v` gate; prompt/cache dumps demoted.
+- `batched-bench`: guard the logits write when pp is zero (no more false failures at np>1).
+- Hybrid/recurrent archs: warn on interleaved sequence ids, no ctx shift, ubatch clamped to
+  the sequence run.
+
+## Running it (what production actually uses)
+
+```bash
+# big MoE chat/decisions box (dual socket Xeon 6):
+llama-server -m model-176B-IQ4_XS.gguf \
+  --numa mirror-nonexp --numa-mirror weights --numa-expert-cache-mb 10000 \
+  -t 64 -tb 64 -np 8 -c 2097152 -b 262144 -ub 2048 \
+  -fa on -ctk q6_0 -ctv q6_0 \
+  --spec-type ngram-mod:n_max=32,n_min=8,ngram_size_n=12   # add --spec-parallel to draft at np>1
+
+# reranker behind LiteLLM (rerank/score endpoints are compiled in, no extra flag):
+llama-server -m Qwen3-VL-Reranker-8B.gguf --mmproj mmproj.f16.gguf \
+  -np 4 -b 8192 -ub 2048 -c 16384 -fa on -ctk q6_0 -ctv q6_0 \
+  -a Qwen3-VL-Reranker-8B --api-key-file /inference/api-key-file
+```
+
+Service scripts, ports (8082 decisions/chat, 8083 embedding, 8084 rerank), gateway wiring and
+endpoint examples for the LiteLLM deployment live in `LOG.md` and the team's Notion usage page.
 
 ---
 
