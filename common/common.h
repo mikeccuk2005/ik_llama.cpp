@@ -364,6 +364,7 @@ struct gpt_params {
     int      numa_nonexp_node = -1;               // mirror-nonexp: node for expert tensors, -1 = alternate by layer
     size_t   numa_expert_cache_mb = 0;            // mirror-nonexp: per-node budget for hot non-local experts (0 = off)
     int      numa_ctx_split       = 1;            // >1: one llama_context per NUMA node, decoded concurrently
+    std::string numa_prefill_team = "node";       // ctx-split solo prefill: "node" stays on the node, "box" borrows both
     int      numa_slot_split      = 0;            // split mixed-socket decode batches per node (slots >= n_seq_max/2 -> node 1)
 
     enum llama_split_mode        split_mode        = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs

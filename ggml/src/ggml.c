@@ -5356,6 +5356,19 @@ int ggml_numa_node_count(void) {
     return g_state.numa.n_nodes > 0 ? (int) g_state.numa.n_nodes : 1;
 }
 
+// ggml_numa_node_cpus: hardware threads that belong to one NUMA node.
+int ggml_numa_node_cpus(int node) {
+    if (node < 0 || node >= (int) g_state.numa.n_nodes) {
+        return 0;
+    }
+    return (int) g_state.numa.nodes[node].n_cpus;
+}
+
+// ggml_numa_total_cpus: hardware threads on the whole system (0 before ggml_numa_init).
+int ggml_numa_total_cpus(void) {
+    return (int) g_state.numa.total_cpus;
+}
+
 bool ggml_numa_mirror_active(void) {
     return (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR ||
             g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR_NONEXP) && g_state.numa.n_nodes > 1;

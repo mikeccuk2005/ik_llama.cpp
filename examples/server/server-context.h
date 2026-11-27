@@ -253,6 +253,9 @@ struct server_context {
     llama_context* ctx = nullptr;
     std::vector<llama_context*> ctxs; // one per NUMA node when --numa-ctx-split > 1; ctxs[0] == ctx
     int n_ctx_split = 1;
+    int n_ith_total = 0; // thread team size every context's ith window is measured against
+    int n_ith_node  = 0; // ith window of one NUMA node (decode inside it, prefill widens to it)
+    bool n_ith_per_node = false; // true when windows follow the real NUMA topology
     std::vector<llama_lora_adapter_container> lora_adapters;
     std::vector<control_vector_container> control_vectors;
 

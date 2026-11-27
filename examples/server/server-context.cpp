@@ -45,6 +45,27 @@ static bool server_slot_spec_text_ok(server_slot & slot) {
     return !slot.cache_tokens.has_mtmd || !slot.cache_tokens.has_mtmd_data();
 }
 
+// numa_threads_per_core: SMT width of the box, from cpu0's sibling list (1 when unknown).
+// Every prefill team is capped at physical cores because stacking siblings measured worse
+// than one thread per core for both decode and prefill on dual-socket Xeon.
+static int numa_threads_per_core() {
+    static const int tpc = [] {
+        std::ifstream f("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list");
+        std::string line;
+        if (!std::getline(f, line)) {
+            return 1;
+        }
+        int n = 1;
+        for (char c : line) {
+            if (c == ',') {
+                ++n;
+            }
+        }
+        return n;
+    }();
+    return tpc;
+}
+
 // ---- context-checkpoint disk spill (NVMe offload for checkpoint RAM) ----
 // A spilled entry keeps positions + spill_path with empty data; restore
 // reloads from disk (slot-checkpoint file format), failures fall back to
@@ -293,23 +314,49 @@ bool server_context::load_model(const gpt_params& params_) {
     ctxs.push_back(ctx);
     if (n_ctx_split > 1) {
         const int32_t n_thr = std::max(1, params_base.n_threads);
-        const int32_t ith_total = n_thr * n_ctx_split;
 
-        llama_set_ith_range(ctx, 0, ith_total);
+        // Thread geometry: every context gets a window inside its own NUMA node, so decode,
+        // prefill and draft passes never reach the other socket. The team is sized from the
+        // NUMA topology when the strategy mirrors weights (that is what the ith -> node split
+        // assumes); otherwise the old -t * split team is kept so the mapping still holds.
+        const bool node_windows =
+            (params_base.numa == GGML_NUMA_STRATEGY_MIRROR || params_base.numa == GGML_NUMA_STRATEGY_MIRROR_NONEXP) &&
+            ggml_numa_node_count() == n_ctx_split &&
+            ggml_numa_total_cpus() >= n_thr * n_ctx_split;
+
+        if (node_windows) {
+            // windows are counted in physical cores: the ith -> node split is a block split, so
+            // a team that should cover both sockets needs one ith per physical core, not per SMT
+            // sibling. Threads pin to their node's cpuset, so the scheduler keeps them core-local.
+            n_ith_total = std::max(1, ggml_numa_total_cpus() / std::max(1, numa_threads_per_core()));
+            n_ith_node  = std::max(1, n_ith_total / n_ctx_split);
+        } else {
+            n_ith_total = n_thr * n_ctx_split;
+            n_ith_node  = n_thr;
+        }
+        n_ith_per_node = node_windows;
+        if (n_thr > n_ith_node) {
+            SRV_WRN("--threads %d is wider than the %d threads of one NUMA node window\n", (int) n_thr, n_ith_node);
+        }
+        const int32_t n_thr_win = std::min<int32_t>(n_thr, n_ith_node);
+        const int32_t n_tb_win  = std::min<int32_t>(std::max<int32_t>(1, params_base.n_threads_batch), n_ith_node);
+
+        llama_set_ith_range(ctx, 0, n_ith_total);
+        llama_set_n_threads(ctx, n_thr_win, n_tb_win);
 
         for (int i = 1; i < n_ctx_split; ++i) {
             llama_context_params cparams = common_context_params_to_llama(params_base);
             cparams.n_ctx           = llama_n_ctx(ctx);
             cparams.n_seq_max       = params_base.n_parallel; // keep seq ids global
-            cparams.n_threads       = n_thr;
-            cparams.n_threads_batch = params_base.n_threads_batch;
+            cparams.n_threads       = n_thr_win;
+            cparams.n_threads_batch = n_tb_win;
 
             llama_context * c = llama_init_from_model(model, cparams);
             if (c == nullptr) {
                 LOG_ERROR("failed to create context for NUMA node", { {"node", i} });
                 return false;
             }
-            llama_set_ith_range(c, i * n_thr, ith_total);
+            llama_set_ith_range(c, i * n_ith_node, n_ith_total);
             ctxs.push_back(c);
         }
         if (!params_base.system_prompt.empty()) {
@@ -323,8 +370,10 @@ bool server_context::load_model(const gpt_params& params_) {
                 {"node",     i},
                 {"n_ctx",    llama_n_ctx(ctxs[i])},
                 {"n_seq_max", llama_n_seq_max(ctxs[i])},
-                {"ith_from", i * n_thr},
-                {"ith_to",   i * n_thr + n_thr - 1},
+                {"ith_from", i * n_ith_node},
+                {"ith_to",   i * n_ith_node + n_ith_node - 1},
+                {"decode_threads", n_thr_win},
+                {"prefill_threads", n_ith_node},
             });
         }
     }
@@ -491,17 +540,18 @@ void server_context::init() {
                 if (n_ctx_split > 1) {
                     // The draft head lives in its own context, created by the spec layer without a
                     // thread range, so it would run unpinned across both sockets. Pin it to the
-                    // slot's node: the head is small, latency matters more than its bandwidth.
+                    // slot's node window: the head is small, latency matters more than bandwidth.
                     int ci = 0;
                     for (size_t k = 0; k < ctxs.size(); ++k) {
                         if (ctxs[k] == slot.ctx) { ci = (int) k; break; }
                     }
-                    const int n_thr_team = (int) params_base.n_threads;
+                    const int n_win = n_ith_node > 0 ? n_ith_node : (int) params_base.n_threads;
+                    const int n_thr_team = std::min<int>((int) params_base.n_threads, n_win);
                     for (const auto * dc : common_speculative_get_draft_contexts(slot.spec)) {
                         auto * dcw = const_cast<llama_context *>(dc);
-                        // one socket's worth of threads, on the slot's node
+                        // one node's worth of threads, inside the slot's node window
                         llama_set_n_threads(dcw, n_thr_team, n_thr_team);
-                        llama_set_ith_range(dcw, ci * n_thr_team, n_thr_team * n_ctx_split);
+                        llama_set_ith_range(dcw, ci * n_win, n_ith_total > 0 ? n_ith_total : n_win);
                     }
                 }
                 break;
@@ -5311,19 +5361,31 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         };
 
         int ret = 0;
-        // A single context prefilling alone may borrow the whole process team: half a box of
-        // threads is what caps per-request prefill. Concurrent prefills keep their own halves.
+        // A single context prefilling alone may widen to its whole NUMA node window: every core
+        // of that node, SMT siblings included, never the other socket. Concurrent prefills keep
+        // their own node windows, so nothing has to be shared between teams.
         bool wide = false;
         const int n_thr_team = (int) params_base.n_threads;
-        const int ith_total  = n_thr_team * n_ctx_split;
+        const int ith_total  = n_ith_total > 0 ? n_ith_total : n_thr_team * n_ctx_split;
+        const int n_win      = n_ith_node  > 0 ? n_ith_node  : n_thr_team;
         if (runs.size() == 1 && n_ctx_split > 1 && runs[0].n >= 512) {
             int ci = 0;
             for (size_t k = 0; k < ctxs.size(); ++k) {
                 if (ctxs[k] == runs[0].c) { ci = (int) k; break; }
             }
-            llama_set_prefill_team(runs[0].c, 0, ith_total, (uint32_t) params_base.n_threads_batch * n_ctx_split);
-            ret = server_decode(runs[0].c, make_view(runs[0]));
-            llama_set_prefill_team(runs[0].c, ci * n_thr_team, ith_total, (uint32_t) params_base.n_threads_batch);
+            const int n_tb_cfg = std::max<int>(1, params_base.n_threads_batch);
+            if (n_ith_per_node && params_base.numa_prefill_team != "box") {
+                // stay on this context's own node: one thread per physical core of that node
+                llama_set_prefill_team(runs[0].c, ci * n_win, ith_total, (uint32_t) n_win);
+                ret = server_decode(runs[0].c, make_view(runs[0]));
+                llama_set_prefill_team(runs[0].c, ci * n_win, ith_total, (uint32_t) std::min<int>(n_tb_cfg, n_win));
+            } else {
+                // borrow the other node(s): the whole physical-core team, block-split across nodes
+                const uint32_t n_tb_wide = (uint32_t) std::min<int>(ith_total, n_win * n_ctx_split);
+                llama_set_prefill_team(runs[0].c, 0, ith_total, n_tb_wide);
+                ret = server_decode(runs[0].c, make_view(runs[0]));
+                llama_set_prefill_team(runs[0].c, ci * n_win, ith_total, (uint32_t) std::min<int>(n_tb_cfg, n_win));
+            }
             wide = true;
         }
         if (wide) {

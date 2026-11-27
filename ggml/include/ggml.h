@@ -996,6 +996,8 @@ extern "C" {
 
     // NUMA mirroring (GGML_NUMA_STRATEGY_MIRROR): duplicate read-mostly data per NUMA node
     GGML_API int      ggml_numa_node_count(void);                  // number of NUMA nodes detected (>=1)
+    GGML_API int      ggml_numa_node_cpus(int node);               // hardware threads on one NUMA node (0 when unknown)
+    GGML_API int      ggml_numa_total_cpus(void);                  // hardware threads across all NUMA nodes
     GGML_API bool     ggml_numa_mirror_active(void);               // true if strategy is MIRROR or MIRROR_NONEXP and >1 node
     GGML_API void     ggml_numa_set_mirror(uint32_t flags);        // which ggml_numa_mirror_flags to mirror
     GGML_API uint32_t ggml_numa_get_mirror(void);                  // current mirror flags
